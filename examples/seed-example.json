@@ -1,0 +1,105 @@
+{
+  "systems": [
+    {
+      "id": "SYS-001",
+      "name": "My Project"
+    }
+  ],
+  "domains": [
+    {
+      "id": "DOM-backend",
+      "name": "Backend",
+      "systemId": "SYS-001"
+    },
+    {
+      "id": "DOM-frontend",
+      "name": "Frontend",
+      "systemId": "SYS-001"
+    }
+  ],
+  "modules": [
+    {
+      "id": "MOD-api",
+      "name": "API Layer",
+      "instance": "core",
+      "domainId": "DOM-backend",
+      "paths": [
+        "backend/internal/api/"
+      ],
+      "type": "service"
+    },
+    {
+      "id": "MOD-auth",
+      "name": "Auth",
+      "instance": "core",
+      "domainId": "DOM-backend",
+      "paths": [
+        "backend/internal/auth/"
+      ],
+      "type": "service"
+    },
+    {
+      "id": "MOD-ui",
+      "name": "UI",
+      "instance": "ui",
+      "domainId": "DOM-frontend",
+      "paths": [
+        "src/features/"
+      ],
+      "type": "ui"
+    }
+  ],
+  "features": [
+    {
+      "id": "F-API-001",
+      "name": "CRUD endpoints",
+      "moduleId": "MOD-api",
+      "status": "Active"
+    },
+    {
+      "id": "F-AUTH-001",
+      "name": "Authentication",
+      "moduleId": "MOD-auth",
+      "status": "Active"
+    },
+    {
+      "id": "F-UI-001",
+      "name": "Dashboard",
+      "moduleId": "MOD-ui",
+      "status": "Active"
+    }
+  ],
+  "dirCategories": [
+    {
+      "id": "DC-go",
+      "dirPrefix": "backend/",
+      "filePattern": "_test.go",
+      "testCategory": "component",
+      "description": "Go unit tests"
+    },
+    {
+      "id": "DC-py",
+      "dirPrefix": "tests/",
+      "filePattern": "test_",
+      "testCategory": "integration",
+      "description": "API tests"
+    }
+  ],
+  "testPackages": [],
+  "tests": [],
+  "endpoints": [],
+  "symbols": [],
+  "users": [],
+  "applications": [],
+  "userStories": [],
+  "useCases": [],
+  "enhancements": [],
+  "defects": [],
+  "archDecisions": [],
+  "archStandards": [],
+  "feedback": [],
+  "scenarios": [],
+  "trainingPrograms": [],
+  "prerequisiteFor": [],
+  "usesPattern": []
+}

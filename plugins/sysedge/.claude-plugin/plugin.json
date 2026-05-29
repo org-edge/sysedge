@@ -1,0 +1,25 @@
+{
+  "name": "sysedge",
+  "description": "The knowledge-graph layer for Claude Code multi-agent teams. Sessions orient in 30 seconds from a shared requirements graph (stories -> use cases -> features -> modules -> tests) instead of re-reading source files. Provides briefing, worklog, and test-gap orientation; marks work in-progress so parallel sessions never collide. Requires the free SysEdge CLI and a local Neo4j instance.",
+  "version": "1.1.0",
+  "author": {
+    "name": "OrgEdge",
+    "email": "sysedge@org-edge.com",
+    "url": "https://www.org-edge.com"
+  },
+  "homepage": "https://www.org-edge.com/sysgraph.html",
+  "repository": "https://github.com/org-edge/sysedge",
+  "license": "MIT + Commons Clause",
+  "keywords": [
+    "claude-code",
+    "knowledge-graph",
+    "ontology",
+    "multi-agent",
+    "neo4j",
+    "requirements-traceability",
+    "context-engineering",
+    "token-savings",
+    "testing",
+    "v-model"
+  ]
+}

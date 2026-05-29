@@ -1,0 +1,31 @@
+# SysEdge — Neo4j setup
+# Run: docker compose up -d
+# Then: python3 cli/sys_graph.py init
+
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: sysedge-neo4j
+    # Uses port 7688 (not 7687) to avoid collision with your application Neo4j.
+    # Set SYSGRAPH_NEO4J_URI=bolt://localhost:7688 in your .env.
+    ports:
+      - "7688:7687"   # Bolt (driver connection — note host port 7688)
+      - "7475:7474"   # Browser UI — http://localhost:7475 (optional)
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-sysedge}"
+      NEO4J_PLUGINS: '[]'
+      NEO4J_dbms_memory_heap_initial__size: "512m"
+      NEO4J_dbms_memory_heap_max__size: "1G"
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-sysedge}",
+             "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  neo4j_data:
+    name: sysedge-neo4j-data

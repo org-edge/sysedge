@@ -1,0 +1,41 @@
+{
+  "name": "sysedge",
+  "owner": {
+    "name": "OrgEdge",
+    "email": "sysedge@org-edge.com",
+    "url": "https://www.org-edge.com"
+  },
+  "metadata": {
+    "description": "SysEdge — the ontological knowledge-graph layer for Claude Code multi-agent teams. Shared, queryable orientation across parallel sessions.",
+    "version": "1.1.0"
+  },
+  "plugins": [
+    {
+      "name": "sysedge",
+      "source": "./plugins/sysedge",
+      "description": "Give every Claude Code session 30-second orientation from a shared requirements graph: briefing, worklog, and test-gap commands that cut orientation tokens by up to 96% and stop parallel sessions duplicating work.",
+      "version": "1.1.0",
+      "author": {
+        "name": "OrgEdge",
+        "email": "sysedge@org-edge.com",
+        "url": "https://www.org-edge.com"
+      },
+      "homepage": "https://www.org-edge.com/sysgraph.html",
+      "repository": "https://github.com/org-edge/sysedge",
+      "license": "MIT + Commons Clause",
+      "keywords": [
+        "claude-code",
+        "knowledge-graph",
+        "ontology",
+        "multi-agent",
+        "neo4j",
+        "requirements-traceability",
+        "context-engineering",
+        "token-savings",
+        "testing",
+        "v-model"
+      ],
+      "category": "workflow"
+    }
+  ]
+}

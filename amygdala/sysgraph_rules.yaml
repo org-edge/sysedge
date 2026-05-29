@@ -1,0 +1,99 @@
+# ============================================================================
+# SysEdge Amygdala Rules
+# ============================================================================
+# Hard rules for the SysEdge session guard. These enforce the safety model
+# that is otherwise documented only in skill files (which Claude can rationalize
+# around). The amygdala enforces them at the hook level.
+#
+# Trigger phrases are matched via keyword overlap. At least 2 keywords must
+# overlap between the context and the trigger to fire the rule. Design triggers
+# with at least 2 distinctive words that are unlikely to appear together
+# in innocent commands.
+#
+# Severity:
+#   critical — PreToolUse HARD BLOCK when matched
+#   high     — Inject warning into context, don't block
+#   medium   — Inject gentle reminder
+#
+# check_code: true  → only fires on Write/Edit hooks (code-specific)
+# check_code: false → fires on UserPromptSubmit AND all tool hooks
+# ============================================================================
+
+rules:
+
+  # ── HARD BLOCKS (critical guardrails) ─────────────────────────────────────
+
+  - id: SG-G-001
+    type: guardrail
+    trigger: "DETACH DELETE cypher neo4j raw query permanent nodes"
+    response: "BLOCKED: Never write raw DETACH DELETE Cypher. Only sys_graph.py may delete nodes. Describe what you need to the user and wait."
+    severity: critical
+    context: "DETACH DELETE on the shared graph is permanent and affects all parallel sessions. sys_graph.py is the only safe delete path."
+    check_code: false
+
+  - id: SG-G-002
+    type: guardrail
+    trigger: "reset confirm destroy wipe all nodes entire graph"
+    response: "BLOCKED: sys_graph.py reset --confirm requires explicit user instruction. Stop and ask the user."
+    severity: critical
+    context: "reset --confirm destroys the entire shared graph. Only the sys-graph instance may run it, and only with explicit user instruction."
+    check_code: false
+
+  # ── HIGH WARNINGS (inject guidance, do not block) ─────────────────────────
+
+  - id: SG-W-001
+    type: warning
+    trigger: "seed restore sessions wipe bare without"
+    response: "WARNING: Always include --instance <name> with seed. Bare seed without --instance wipes ALL instances including parallel sessions."
+    severity: high
+    context: "Bare seed wipes ALL instance data. Per-instance seed is safe: seed <file> --instance <name>."
+    check_code: false
+
+  - id: SG-W-002
+    type: warning
+    trigger: "git commit push stash amend stage working tree"
+    response: "WARNING: Never run git commit, git push, or git stash. Only the user commits. git stash silently captures other sessions' uncommitted work."
+    severity: high
+    context: "Multiple parallel sessions share one working tree. Stash/commit/push by a session causes invisible data loss for other sessions."
+    check_code: false
+
+  - id: SG-W-003
+    type: warning
+    trigger: "docker restart neo4j container sysgraph-neo4j sysedge-neo4j database"
+    response: "WARNING: Never restart the Neo4j container — it kills all open drivers across every parallel session. Ask the user to restart if needed."
+    severity: high
+    context: "Container restart mid-session drops all Neo4j connections including those held by other Claude sessions."
+    check_code: false
+
+  - id: SG-W-004
+    type: warning
+    trigger: "write python script manipulate bulk import update nodes driver"
+    response: "WARNING: Do not write one-off Python scripts for graph manipulation. Use sys_graph.py commands only. If the command doesn't exist, describe what you need to the user and wait."
+    severity: high
+    context: "One-off scripts bypass instance scoping and auto-backup. They have caused graph corruption in the past."
+    check_code: true
+
+  - id: SG-W-005
+    type: warning
+    trigger: "sys_graph_reset shell script execute run reset"
+    response: "WARNING: sys_graph_reset.sh is a user-only shell script. Claude sessions cannot run it — only the user can execute it interactively."
+    severity: high
+    context: "The reset script requires typing 'DELETE ALL SYS NODES' interactively. It cannot be triggered by a session."
+    check_code: false
+
+  # ── MEDIUM REMINDERS ──────────────────────────────────────────────────────
+
+  - id: SG-R-001
+    type: preference
+    trigger: "no verify skip hooks bypass commit force push"
+    response: "REMINDER: Never skip pre-commit hooks (--no-verify) unless the user explicitly asks. If a hook fails, investigate and fix the root cause."
+    severity: medium
+    check_code: false
+
+  - id: SG-R-002
+    type: preference
+    trigger: "modify write edit other project instance scope cross"
+    response: "REMINDER: Stay in your declared instance scope. You may read other projects' code but must not write to their files. File cross-instance work as an enhancement."
+    severity: medium
+    context: "Cross-instance writes introduce inconsistencies that the owning session cannot see or fix."
+    check_code: false
