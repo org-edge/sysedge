@@ -150,8 +150,6 @@ SysEdge enforces the V-model. Each spec artefact has a required test artefact:
 - Sessions only write nodes in their declared instance scope
 - The `amygdala/` directory is an optional PreToolUse hook that enforces these rules in real time — see `amygdala/README.md`
 
-**Note on `--dangerously-skip-permissions`:** this flag appears in the demo recording scripts (`formbricks-demo/demo.py`) to allow unattended batch execution during demos. It is **not used by the plugin or skill** — the skill file contains no hooks and makes no automatic tool calls. The flag is documented here for full transparency.
-
 ---
 
 ## Pricing
