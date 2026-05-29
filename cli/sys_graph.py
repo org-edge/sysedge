@@ -4420,7 +4420,7 @@ class _HideInternalFormatter(argparse.RawDescriptionHelpFormatter):
 
 def main():
     # Intercept premium commands before argparse validates their arguments
-    _PREMIUM = {"analyse", "commit-import", "coverage-review", "create-adr", "export", "merge-nodes", "migrate-binary", "preview-import", "seed-standards"}
+    _PREMIUM = {"analyse", "commit-import", "traceability-review", "create-adr", "export", "merge-nodes", "migrate-binary", "preview-import", "seed-standards"}
     if len(sys.argv) > 1 and sys.argv[1] in _PREMIUM:
         print("\n  ⚡ Bootstrap Kit command — https://www.org-edge.com/sysedge.html")
         print()
@@ -4636,7 +4636,7 @@ def main():
     sp.add_argument("--format", default="md", choices=["md","text"],
                     help="Output format: md (default) or text summary")
 
-    sp = sub.add_parser("coverage-review",
+    sp = sub.add_parser("traceability-review",
                         help="AI sufficiency check on US→UC and UC→Feature chains (uses Claude API)")
     sp.add_argument("--scope",    default="both", choices=["us","uc","both"],
                     help="Which chain to review: us (story→UC), uc (UC→feature), or both (default)")
@@ -4946,7 +4946,7 @@ def main():
         "link-blocks":         cmd_link_blocks,
         "migrate-binary":      _upgrade,
         "coverage-report":     cmd_coverage_report,
-        "coverage-review":     _upgrade,
+        "traceability-review":     _upgrade,
         "preview-import":  _upgrade,
         "commit-import":   _upgrade,
         "create-usecase":  cmd_create_usecase,

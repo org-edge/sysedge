@@ -200,7 +200,7 @@ The following require the **SysEdge Bootstrap Kit** ($149/repo):
 
 - `export` — structured Markdown/JSON document export
 - `analyse` — merge candidates, split candidates, orphan detection
-- `coverage-review` — AI semantic sufficiency check (PASS/PARTIAL/GAP/INSUFFICIENT)
+- `traceability-review` — AI semantic sufficiency check (PASS/PARTIAL/GAP/INSUFFICIENT)
 - `create-adr` — architecture decision records
 - `preview-import` / `commit-import` — requirements import pipeline
 - `/init-sysedge` — auto-seed from working directory

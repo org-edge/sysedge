@@ -155,7 +155,7 @@ SysEdge enforces the V-model. Each spec artefact has a required test artefact:
 
 **Free (this repo):** CLI, skill file, Docker Compose setup, patterns — everything in this README.
 
-**$149/repository** — [Bootstrap Kit](https://www.org-edge.com/sysedge.html): web visualiser, `/init-sysedge` auto-seed skill, architecture standards catalogue (53 standards), AI coverage review, export and analysis commands, session templates, 12 months updates and email support.
+**$149/repository** — [Bootstrap Kit](https://www.org-edge.com/sysedge.html): web visualiser, `/init-sysedge` auto-seed skill, architecture standards catalogue (53 standards), AI traceability review, export and analysis commands, session templates, 12 months updates and email support.
 
 ---
 
