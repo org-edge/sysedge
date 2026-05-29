@@ -58,7 +58,7 @@ try:
 except ImportError:
     pass
 
-# SysEdge uses its own dedicated Neo4j (SYSGRAPH_NEO4J_*) to isolate the
+# SysGraph uses its own dedicated Neo4j (SYSGRAPH_NEO4J_*) to isolate the
 # system knowledge graph from the application Neo4j.  This prevents test
 # teardowns and application code from ever touching Sys* nodes.
 # Fall back to NEO4J_* if SYSGRAPH_NEO4J_* are not set (single-instance dev).
@@ -862,7 +862,7 @@ def cmd_briefing(args):
     print("═" * W)
     print(f"  SYSTEM GRAPH BRIEFING — {instance}  ({today})")
     print("═" * W)
-    print(f"  Free CLI — full features (export, analyse, AI review, visualiser) at https://www.org-edge.com/sysedge.html")
+    print(f"  Free CLI — full features (export, analyse, AI review, visualiser) at https://www.org-edge.com/sysgraph.html")
 
     # Group coverage by module
     from collections import defaultdict
@@ -4064,7 +4064,7 @@ def cmd_coverage_report(args):
     scope_tag = f" — {instance}" if instance else " — all instances"
 
     if fmt == "md":
-        print(f"# SysEdge Coverage Report{scope_tag}  ({today})\n")
+        print(f"# SysGraph Coverage Report{scope_tag}  ({today})\n")
 
         if tier_filter in ("all", "1"):
             print(f"## T1 — User Stories without Use Cases ({len(t1_rows)})\n")
@@ -4420,9 +4420,9 @@ class _HideInternalFormatter(argparse.RawDescriptionHelpFormatter):
 
 def main():
     # Intercept premium commands before argparse validates their arguments
-    _PREMIUM = {"analyse", "commit-import", "traceability-review", "create-adr", "export", "merge-nodes", "migrate-binary", "preview-import", "seed-standards"}
+    _PREMIUM = {"analyse", "commit-import", "coverage-review", "create-adr", "export", "merge-nodes", "migrate-binary", "preview-import", "seed-standards"}
     if len(sys.argv) > 1 and sys.argv[1] in _PREMIUM:
-        print("\n  ⚡ Bootstrap Kit command — https://www.org-edge.com/sysedge.html")
+        print("\n  ⚡ Bootstrap Kit command — https://www.org-edge.com/sysgraph.html")
         print()
         sys.exit(0)
 
@@ -4444,7 +4444,7 @@ def main():
 
     sp = sub.add_parser("seed-standards",
                         help=argparse.SUPPRESS)
-    sp.add_argument("file", help="Path to YAML standards file (see tools/sysedge/examples/arch-standards.yaml)")
+    sp.add_argument("file", help="Path to YAML standards file (see tools/sysgraph/examples/arch-standards.yaml)")
 
     sp = sub.add_parser("seed", help="Load JSON seed file")
     sp.add_argument("file", help="Path to seed JSON")
@@ -4636,7 +4636,7 @@ def main():
     sp.add_argument("--format", default="md", choices=["md","text"],
                     help="Output format: md (default) or text summary")
 
-    sp = sub.add_parser("traceability-review",
+    sp = sub.add_parser("coverage-review",
                         help="AI sufficiency check on US→UC and UC→Feature chains (uses Claude API)")
     sp.add_argument("--scope",    default="both", choices=["us","uc","both"],
                     help="Which chain to review: us (story→UC), uc (UC→feature), or both (default)")
@@ -4704,10 +4704,10 @@ def main():
                     choices=["union","prefer-keep","prefer-absorb"])
 
     sp = sub.add_parser("preview-import", help=argparse.SUPPRESS)
-    sp.add_argument("file", help="Path to sysedge.import.v1 JSON file")
+    sp.add_argument("file", help="Path to sysgraph.import.v1 JSON file")
 
     sp = sub.add_parser("commit-import", help=argparse.SUPPRESS)
-    sp.add_argument("file",        help="Path to sysedge.import.v1 JSON file")
+    sp.add_argument("file",        help="Path to sysgraph.import.v1 JSON file")
     sp.add_argument("--decisions", required=True, help="Path to decisions JSON (from preview-import)")
 
     sp = sub.add_parser("analyse", help="Analyse graph for orphans, merge candidates, or split candidates")
@@ -4906,7 +4906,7 @@ def main():
 
     # Premium commands — not in the free CLI
     def _upgrade(args):
-        print("\n  ⚡ Bootstrap Kit command — https://www.org-edge.com/sysedge.html")
+        print("\n  ⚡ Bootstrap Kit command — https://www.org-edge.com/sysgraph.html")
         print()
         import sys; sys.exit(0)
 
@@ -4946,7 +4946,7 @@ def main():
         "link-blocks":         cmd_link_blocks,
         "migrate-binary":      _upgrade,
         "coverage-report":     cmd_coverage_report,
-        "traceability-review":     _upgrade,
+        "coverage-review":     _upgrade,
         "preview-import":  _upgrade,
         "commit-import":   _upgrade,
         "create-usecase":  cmd_create_usecase,
