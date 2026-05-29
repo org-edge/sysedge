@@ -69,7 +69,7 @@ python3 cli/sys_graph.py seed data/sys-init.json
 
 See `examples/seed-example.json` for the format and `INSTANCES.md` for how to design your instance topology.
 
-> **Bootstrap Kit users:** use `/init-sysedge` in a Claude Code session to auto-generate the seed from your working directory. [Get the kit →](https://www.org-edge.com/sysgraph.html)
+> **Bootstrap Kit users:** use `/init-sysedge` in a Claude Code session to auto-generate the seed from your working directory. [Get the kit →](https://www.org-edge.com/sysedge.html)
 
 ---
 

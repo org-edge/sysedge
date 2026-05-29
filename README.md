@@ -76,7 +76,7 @@ curl -o .claude/skills/sysedge/SKILL.md \
 
 The **Bootstrap Kit** includes `/init-sysedge` — a Claude Code skill that scans your working directory, detects Go/TypeScript/Python/Java/C# structure, and generates a complete seed JSON automatically. No manual JSON writing required.
 
-[Get the Bootstrap Kit →](https://www.org-edge.com/sysgraph.html)
+[Get the Bootstrap Kit →](https://www.org-edge.com/sysedge.html)
 
 ---
 
@@ -155,7 +155,7 @@ SysEdge enforces the V-model. Each spec artefact has a required test artefact:
 
 **Free (this repo):** CLI, skill file, Docker Compose setup, patterns — everything in this README.
 
-**$149/repository** — [Bootstrap Kit](https://www.org-edge.com/sysgraph.html): web visualiser, `/init-sysedge` auto-seed skill, architecture standards catalogue (53 standards), AI coverage review, export and analysis commands, session templates, 12 months updates and email support.
+**$149/repository** — [Bootstrap Kit](https://www.org-edge.com/sysedge.html): web visualiser, `/init-sysedge` auto-seed skill, architecture standards catalogue (53 standards), AI coverage review, export and analysis commands, session templates, 12 months updates and email support.
 
 ---
 
