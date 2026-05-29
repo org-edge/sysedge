@@ -1689,49 +1689,6 @@ def cmd_backup(args):
     _do_backup(out_path)
 
 
-def cmd_activate(args):
-    """Activate SysEdge with a Lemon Squeezy licence key (one-time online, then offline)."""
-    import importlib.util, os as _os
-    lic_path = Path(__file__).parent / "licence.py"
-    if not lic_path.exists():
-        # Also check same directory as this script
-        lic_path = Path(_os.path.dirname(_os.path.abspath(__file__))) / "licence.py"
-    if not lic_path.exists():
-        print("  ✗  licence.py not found — ensure you are running the Bootstrap Kit.", file=sys.stderr)
-        sys.exit(1)
-    spec = importlib.util.spec_from_file_location("licence", lic_path)
-    lic = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(lic)
-    url = getattr(args, "url", None) or "https://sysedge.org-edge.com/activate"
-    ok = lic.activate(args.key, activation_url=url)
-    sys.exit(0 if ok else 1)
-
-
-def cmd_licence_info(args):
-    """Show current licence status."""
-    import importlib.util, os as _os
-    lic_path = Path(__file__).parent / "licence.py"
-    if not lic_path.exists():
-        lic_path = Path(_os.path.dirname(_os.path.abspath(__file__))) / "licence.py"
-    if not lic_path.exists():
-        print("  No licence.py found — running as free CLI.")
-        return
-    spec = importlib.util.spec_from_file_location("licence", lic_path)
-    lic = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(lic)
-    info = lic.licence_info()
-    if not info:
-        print("  No valid licence found.")
-        print("  Activate with: python3 cli/sys_graph.py activate <your-key>")
-    else:
-        print(f"  ✓  SysEdge Bootstrap Kit — licensed")
-        print(f"     Email:   {info.get('email', 'unknown')}")
-        print(f"     Issued:  {info.get('issued', '?')}")
-        print(f"     Expires: {info.get('expiry', '?')}")
-
-
-# ── Test file scanner ────────────────────────────────────────────────────────
-
 _TS_DESCRIBE = __import__("re").compile(
     r"""(?:^|\s)(?:describe|describe\.only|describe\.skip)\s*\(\s*['"`]([^'"`]+)['"`]""",
     __import__("re").MULTILINE)
@@ -4420,7 +4377,7 @@ class _HideInternalFormatter(argparse.RawDescriptionHelpFormatter):
 
 def main():
     # Intercept premium commands before argparse validates their arguments
-    _PREMIUM = {"analyse", "commit-import", "coverage-review", "create-adr", "export", "merge-nodes", "migrate-binary", "preview-import", "seed-standards"}
+    _PREMIUM = {"activate", "analyse", "commit-import", "coverage-review", "create-adr", "export", "licence", "merge-nodes", "migrate-binary", "preview-import", "seed-standards"}
     if len(sys.argv) > 1 and sys.argv[1] in _PREMIUM:
         print("\n  ⚡ Bootstrap Kit command — https://www.org-edge.com/sysgraph.html")
         print()
@@ -4964,8 +4921,8 @@ def main():
         "record-run":     cmd_record_run,
         "test-status":    cmd_test_status,
         "backup":         cmd_backup,
-        "activate":       cmd_activate,
-        "licence":        cmd_licence_info,
+        "activate":       _upgrade,
+        "licence":        _upgrade_info,
 
         "scan-go-tests":  cmd_scan_go_tests,
         "scan-tests":     _dispatch_scan_tests,
