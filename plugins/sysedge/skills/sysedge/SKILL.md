@@ -1,6 +1,6 @@
 ---
 name: sysedge
-description: Use at the start of every session — loads the SysEdge knowledge graph layer. Provides 30-second orientation via shared requirements graph: briefing, worklog, test-gaps, and full traceability from user stories to tests.
+description: "Use at the start of every session. Loads the SysEdge knowledge graph layer for 30-second orientation via shared requirements graph: briefing, worklog, test-gaps, and full traceability from user stories to tests."
 ---
 
 # SysEdge — Session Skill

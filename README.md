@@ -53,17 +53,21 @@ cp examples/seed-example.json data/sys-init.json
 python3 cli/sys_graph.py seed data/sys-init.json
 ```
 
-**5. Install the skill into your Claude Code project**
+**5. Install the Claude Code plugin**
+
+Via the plugin marketplace (recommended — requires Claude Code v2.1.128+):
+```
+/plugin marketplace add org-edge/sysedge
+/plugin install sysedge@sysedge
+```
+
+Then invoke with `/sysedge:sysedge` at the start of any session.
+
+Or install manually:
 ```bash
 mkdir -p .claude/skills/sysedge
 curl -o .claude/skills/sysedge/SKILL.md \
   https://raw.githubusercontent.com/org-edge/sysedge/main/plugins/sysedge/skills/sysedge/SKILL.md
-```
-
-Or clone and copy:
-```bash
-git clone https://github.com/org-edge/sysedge.git
-cp sysedge/plugins/sysedge/skills/sysedge/SKILL.md .claude/skills/sysedge/SKILL.md
 ```
 
 ---
