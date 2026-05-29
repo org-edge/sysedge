@@ -45,28 +45,34 @@ cp setup/.env.template .env
 # Edit NEO4J_PASSWORD if changed from default
 ```
 
-**4. Initialise**
+**4. Initialise and seed**
 ```bash
 python3 cli/sys_graph.py init
-python3 cli/sys_graph.py seed examples/seed-example.json   # or use /init-sysedge
+cp examples/seed-example.json data/sys-init.json
+# Edit data/sys-init.json to define your modules and features, then:
+python3 cli/sys_graph.py seed data/sys-init.json
 ```
 
-**5. Install skills into your Claude Code project**
+**5. Install the skill into your Claude Code project**
 ```bash
-mkdir -p .claude/skills/sysedge .claude/skills/init-sysedge
-cp skills/sysedge/SKILL.md .claude/skills/sysedge/
-cp skills/init-sysedge/SKILL.md  .claude/skills/init-sysedge/
+mkdir -p .claude/skills/sysedge
+curl -o .claude/skills/sysedge/SKILL.md \
+  https://raw.githubusercontent.com/org-edge/sysedge/main/plugins/sysedge/skills/sysedge/SKILL.md
+```
+
+Or clone and copy:
+```bash
+git clone https://github.com/org-edge/sysedge.git
+cp sysedge/plugins/sysedge/skills/sysedge/SKILL.md .claude/skills/sysedge/SKILL.md
 ```
 
 ---
 
 ## Bootstrap your project config
 
-Inside a Claude Code session in your project directory:
-```
-/init-sysedge
-```
-Claude scans your working directory, detects Go/TypeScript/Python/Java/C# structure, and generates a complete seed JSON. No manual JSON writing required.
+The **Bootstrap Kit** includes `/init-sysedge` — a Claude Code skill that scans your working directory, detects Go/TypeScript/Python/Java/C# structure, and generates a complete seed JSON automatically. No manual JSON writing required.
+
+[Get the Bootstrap Kit →](https://www.org-edge.com/sysgraph.html)
 
 ---
 
@@ -82,7 +88,6 @@ Claude scans your working directory, detects Go/TypeScript/Python/Java/C# struct
 | `show-enhancement --id ENH-X` | Full description + linked features |
 | `create-enhancement --title "..." --instance X --priority Must` | File new work item |
 | `link-endpoint --feature F-X --method GET --path /api/...` | Link endpoint to feature |
-| `seed-standards arch-standards.yaml` | Load architecture standards from YAML |
 | `backup` | Export full graph to JSON |
 | `seed backup.json --instance X` | Restore only your instance's nodes (safe) |
 
@@ -120,18 +125,6 @@ SysEdge enforces the V-model. Each spec artefact has a required test artefact:
 
 ---
 
-## Architecture audit
-
-53 industry standards (Execution, Development, Operations, Security, Infrastructure) from 12-factor, OWASP, NIST, SRE practice, and cloud-native patterns — stored as graph nodes. Load your own from YAML:
-
-```bash
-python3 cli/sys_graph.py seed-standards examples/arch-standards.yaml
-```
-
-Standards with no addressing ADR = architecture gaps, visible as a single query.
-
----
-
 ## Language support
 
 | Language | Graph features | Code scan | Test scan |
@@ -156,11 +149,9 @@ Standards with no addressing ADR = architecture gaps, visible as a single query.
 
 ## Pricing
 
-**Free:** CLI, visualiser, skill files — use this README.
+**Free (this repo):** CLI, skill file, Docker Compose setup, patterns — everything in this README.
 
-**$149/repository** (bootstrap kit): Docker Compose, `/init-sysedge` skill, session protocol templates per language, architecture standards YAML, 12 months updates, email support.
-
-[**Get the bootstrap kit →**](https://www.org-edge.com/sysedge.html#get-sysedge)
+**$149/repository** — [Bootstrap Kit](https://www.org-edge.com/sysgraph.html): web visualiser, `/init-sysedge` auto-seed skill, architecture standards catalogue (53 standards), AI coverage review, export and analysis commands, session templates, 12 months updates and email support.
 
 ---
 
