@@ -810,8 +810,8 @@ def cmd_briefing(args):
         enhancements = s.run("""
             MATCH (e:SysEnhancement)
             WHERE e.instance = $inst AND e.status <> 'done'
-            OPTIONAL MATCH (e)-[:EXTENDS]->(f:SysFeature)<-[:PROVIDES]-(m:SysModule)
-            WHERE m.id IN $mids
+            OPTIONAL MATCH (e)-[:EXTENDS]->(f:SysFeature)
+            OPTIONAL MATCH (f)<-[:PROVIDES]-(m:SysModule)
             RETURN e.id AS eid, e.title AS title,
                    coalesce(e.status,'proposed') AS status,
                    coalesce(e.priority,'Should') AS priority,
@@ -854,6 +854,14 @@ def cmd_briefing(args):
                    collect(DISTINCT tp.name) AS training
         """, fids=all_fids).data()
         ev_map = {r["fid"]: r for r in evidence_raw}
+
+        # Orphan test count — must be inside session block
+        orphan_tests = s.run("""
+            MATCH (t:SysTest)
+            WHERE NOT ()-[:CONTAINS_TEST]->(t)
+              AND NOT (t)-[:VERIFIES]->()
+            RETURN count(t) AS n
+        """).single()["n"]
 
     drv.close()
 
@@ -952,11 +960,31 @@ def cmd_briefing(args):
             items = by_status.get(st, [])
             if not items:
                 continue
-            print(f"  {st.upper()} ({len(items)})")
+            # Group ENHs that share a feature — avoids 60-line flat lists (FB-229)
+            by_feat: dict = {}
+            ungrouped = []
             for e in items:
-                feat_ref = f"→ {e['fid']}" if e.get("fid") else f"[{e['mid']}]"
-                prio = f"[{e['priority']}]" if e.get("priority") else ""
-                print(f"    {e['eid']:<16} {prio:<8} {e['title'][:60]:<60} {feat_ref}")
+                fid = e.get("fid")
+                if fid:
+                    by_feat.setdefault(fid, []).append(e)
+                else:
+                    ungrouped.append(e)
+            # Print grouped first
+            seen_feat: set = set()
+            for e in items:
+                fid = e.get("fid")
+                if fid and fid in by_feat and fid not in seen_feat:
+                    seen_feat.add(fid)
+                    group = by_feat[fid]
+                    prio = f"[{group[0]['priority']}]" if group[0].get("priority") else ""
+                    if len(group) > 1:
+                        ids = ", ".join(g["eid"] for g in group)
+                        print(f"    {fid:<14} {prio:<8} [{len(group)} ENHs: {ids[:60]}]")
+                    else:
+                        print(f"    {e['eid']:<16} {prio:<8} {e['title'][:60]:<60} → {fid}")
+                elif not fid:
+                    prio = f"[{e['priority']}]" if e.get("priority") else ""
+                    print(f"    {e['eid']:<16} {prio:<8} {e['title'][:60]}")
         print()
     else:
         print("ENHANCEMENTS — none\n")
@@ -988,13 +1016,6 @@ def cmd_briefing(args):
         print()
 
     # ── Orphan warning (FB-108) ───────────────────────────────────────────────
-    # Quick orphan check — if count is high, suggest running analyse-graph
-    orphan_tests = s.run("""
-        MATCH (t:SysTest)
-        WHERE NOT ()-[:CONTAINS_TEST]->(t)
-          AND NOT (t)-[:VERIFIES]->()
-        RETURN count(t) AS n
-    """).single()["n"]
     if orphan_tests > 10:
         print(f"\n  ⚠  {orphan_tests} unlinked tests detected — run: "
               f"sys_graph.py analyse --orphans --instance {instance}")
@@ -1954,6 +1975,12 @@ def _derive_test_category(test_type: str, file_path: str = "",
 
     fp = file_path or ""
     fn = fp.split("/")[-1]   # filename only for pattern matching
+    fnl = fn.lower()
+
+    # Unambiguous filename patterns take priority over dir-mappings (FB-222).
+    # test_e2e_*.py is always e2e regardless of dir category.
+    if fnl.startswith("test_e2e_"):
+        return "e2e"
 
     # Graph directory mappings (loaded once per scan run)
     if dir_mappings:
@@ -1981,7 +2008,6 @@ def _derive_test_category(test_type: str, file_path: str = "",
         return "integration"
 
     # Filename heuristics
-    fnl = fn.lower()
     if "_e2e" in fnl:
         return "e2e"
     if any(x in fnl for x in ("_ui_", "walkthrough", "scenarios",
@@ -2637,6 +2663,9 @@ def cmd_test_gaps(args):
 
     if tier_arg != "all":
         TIERS = [t for t in TIERS if t[0] == tier_arg]
+    elif instance and instance != "master":
+        # E2E tier is owned by master — suppress for other instances unless explicitly requested
+        TIERS = [t for t in TIERS if t[0] != "e2e"]
 
     for tier_name, tier_key, tier_desc, tier_hint in TIERS:
         gaps = [(mid, r) for mid, rows in by_mod.items()
@@ -2992,15 +3021,31 @@ def cmd_link_defect(args):
     """Create a SysDefect node and link it to a feature. --id is optional; auto-assigned if omitted."""
     drv = _driver()
     with drv.session() as s:
+        # Fuzzy duplicate check: warn if an open defect on the same feature has a similar title
+        existing = s.run("""
+            MATCH (d:SysDefect)-[:AFFECTS]->(f:SysFeature {id:$fid})
+            WHERE d.status <> 'closed'
+            RETURN d.id AS did, d.title AS title
+        """, fid=args.feature).data()
+        new_words = set((args.title or "").lower().split())
+        for ex in existing:
+            old_words = set((ex["title"] or "").lower().split())
+            if new_words and old_words:
+                overlap = len(new_words & old_words) / max(len(new_words | old_words), 1)
+                if overlap >= 0.5:
+                    print(f"  ⚠  Possible duplicate: {ex['did']} already open on {args.feature} "
+                          f"with similar title: \"{ex['title']}\"", file=sys.stderr)
+
         if not args.id:
             args.id = _alloc_id(s, "SysDefect", "DEF-")
             print(f"  auto-assigned id: {args.id}", file=sys.stderr)
         s.run("""
             MERGE (d:SysDefect {id:$id})
             SET d.title=$title, d.severity=$sev, d.status='open',
-                d.createdAt=$now, d.instance=$inst
+                d.createdAt=$now, d.instance=$inst, d.description=$desc
         """, id=args.id, title=args.title, sev=args.severity or "medium",
-             now=_now_iso(), inst=args.instance or "")
+             now=_now_iso(), inst=args.instance or "",
+             desc=getattr(args, "description", "") or "")
         s.run("""MATCH (d:SysDefect {id:$id}),(f:SysFeature {id:$fid})
                  MERGE (d)-[:AFFECTS]->(f)""",
               id=args.id, fid=args.feature)
@@ -3313,6 +3358,72 @@ def cmd_show_feedback(args):
     print(f"\n{total} entr{'y' if total==1 else 'ies'}  ·  {actioned} actioned  ·  {total-actioned} pending")
 
 
+def cmd_feedback_summary(args):
+    """Per-instance feedback recency report.
+
+    Shows the last feedback date for every known instance and flags those
+    that have been silent for longer than --days (default: 7).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    threshold_days = getattr(args, "days", 7) or 7
+
+    all_instances = [
+        "architect", "core", "deploy", "framework", "licmcp",
+        "manage", "master", "p1", "plan", "platform", "training",
+    ]
+
+    drv = _driver()
+    with drv.session() as s:
+        rows = s.run("""
+            MATCH (f:SysFeedback)
+            RETURN f.instance AS inst,
+                   max(f.createdAt) AS last,
+                   count(f) AS total,
+                   count(CASE WHEN f.actioned IS NULL OR f.actioned = false THEN 1 END) AS pending
+            ORDER BY last ASC
+        """).data()
+    drv.close()
+
+    by_inst = {r["inst"]: r for r in rows if r["inst"]}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=threshold_days)
+
+    W = 66
+    silent = []
+    print(f"\n{'═' * W}")
+    print(f"  FEEDBACK SUMMARY  (silent threshold: {threshold_days} days)")
+    print(f"{'═' * W}")
+    print(f"  {'Instance':<14} {'Last feedback':<13} {'Total':>6}  {'Pending':>7}  Status")
+    print(f"  {'─' * 14} {'─' * 13} {'─' * 6}  {'─' * 7}  {'─' * 10}")
+
+    for inst in all_instances:
+        r = by_inst.get(inst)
+        if not r:
+            print(f"  {'⚠'} {inst:<13}  {'(no feedback)':13}  {'—':>6}  {'—':>7}  SILENT")
+            silent.append(inst)
+            continue
+        last_str = str(r["last"] or "")[:10]
+        try:
+            last_dt = datetime.fromisoformat(str(r["last"]).replace("Z", "+00:00"))
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            is_silent = last_dt < cutoff
+        except (ValueError, TypeError):
+            is_silent = True
+        tag = "⚠" if is_silent else "✓"
+        status = f"SILENT >{threshold_days}d" if is_silent else "ok"
+        print(f"  {tag} {inst:<13}  {last_str:<13}  {r['total']:>6}  {r['pending']:>7}  {status}")
+        if is_silent:
+            silent.append(inst)
+
+    print(f"{'─' * W}")
+    if silent:
+        print(f"  ⚠  {len(silent)} instance(s) silent >{threshold_days} days: {', '.join(silent)}")
+    else:
+        print(f"  ✓  All instances filed feedback within {threshold_days} days")
+    print(f"{'═' * W}\n")
+
+
 def cmd_ack_feedback(args):
     """Mark one or more SysFeedback entries as actioned."""
     drv = _driver()
@@ -3357,6 +3468,7 @@ def cmd_close_enhancement(args):
         """, id=args.id, now=_now_iso()).single()
         # ENH-600: warn when owning instance has UCs with no REQUIRES→Feature edges
         orphan_uc_count = 0
+        linked_feature_count = 0
         if result:
             inst_to_check = args.instance or (result["inst"] or "")
             if inst_to_check:
@@ -3365,7 +3477,28 @@ def cmd_close_enhancement(args):
                     WHERE NOT (uc)-[:REQUIRES]->(:SysFeature)
                     RETURN count(uc) AS n
                 """, inst=inst_to_check).single()["n"]
+            linked_feature_count = s.run(
+                "MATCH (e:SysEnhancement {id:$id})-[:EXTENDS]->(f:SysFeature) RETURN count(f) AS n",
+                id=args.id
+            ).single()["n"]
+            # ENH-864: UC quality enhancements — check test-gaps on linked features
+            title_lower = (result["title"] or "").lower() if result else ""
+            is_uc_quality = any(kw in title_lower for kw in
+                                ("uc quality", "use case quality", "auth boundaries",
+                                 "exception paths", "acceptance criteria", "uc design"))
+            untested_uc_features = 0
+            if is_uc_quality and linked_feature_count > 0:
+                untested_uc_features = s.run("""
+                    MATCH (e:SysEnhancement {id:$id})-[:EXTENDS]->(f:SysFeature)
+                    WHERE NOT (:SysTest)-[:VERIFIES]->(f)
+                    RETURN count(f) AS n
+                """, id=args.id).single()["n"]
     drv.close()
+    if not result:
+        print(f"⚠ {args.id} not found", file=sys.stderr)
+        return
+    if 'untested_uc_features' not in dir():
+        untested_uc_features = 0
     if not result:
         print(f"⚠ {args.id} not found", file=sys.stderr)
         return
@@ -3376,15 +3509,30 @@ def cmd_close_enhancement(args):
         inst_to_check = args.instance or (result["inst"] or "")
         print(f"⚠  {orphan_uc_count} UC(s) in '{inst_to_check}' have no REQUIRES→Feature edges — "
               f"run link-usecase or link-endpoint to wire them before ending this session", file=sys.stderr)
+    if untested_uc_features:
+        print(f"⚠  UC quality enhancement closed but {untested_uc_features} linked feature(s) still have 0 tests — "
+              f"run audit-test after writing tests to verify coverage", file=sys.stderr)
     print(f"✓ {args.id} done  —  {result['title']}")
+    graph_only = getattr(args, "graph_only", False)
+    test_only  = getattr(args, "test_only",  False)
+    skip_code  = graph_only or test_only or (linked_feature_count == 0)
     if not getattr(args, "skip_checklist", False):
         print(f"\n  Pre-close checklist — confirm before ending your session:")
-        print(f"  □ link-endpoint run for any new API endpoints added this session?")
-        print(f"  □ link-symbol run for any new code symbols added?")
+        if not skip_code:
+            print(f"  □ link-endpoint run for any new API endpoints added this session?")
+            print(f"  □ link-symbol run for any new code symbols added?")
         print(f"  □ UC REQUIRES→Feature edges wired? (link-usecase)")
-        print(f"  □ Tests linked to features? (link-feature)")
+        if not graph_only:
+            print(f"  □ Tests linked to features? (link-feature)")
         print(f"  □ User stories still accurate for what was built?")
-        print(f"  (suppress with --skip-checklist)\n")
+        note = ""
+        if graph_only:
+            note = " [--graph-only: code checklist suppressed]"
+        elif test_only:
+            note = " [--test-only: endpoint/symbol checklist suppressed]"
+        elif linked_feature_count == 0:
+            note = " [no linked features: endpoint/symbol checklist suppressed]"
+        print(f"  (suppress with --skip-checklist{note})\n")
     # Trigger reconciliation
     class _A: pass
     a = _A(); a.id = args.id; a.defect = ""; a.instance = args.instance or ""
@@ -3535,7 +3683,7 @@ def cmd_link_enhancement(args):
 
 
 def cmd_link_usecase(args):
-    """Add feature or story links to an existing SysUseCase without touching its content."""
+    """Add feature, story, or test links to an existing SysUseCase without touching its content."""
     drv = _driver()
     with drv.session() as s:
         if not s.run("MATCH (uc:SysUseCase {id:$id}) RETURN uc.id", id=args.id).single():
@@ -3557,13 +3705,64 @@ def cmd_link_usecase(args):
             s.run("""MATCH (us:SysUserStory {id:$sid}),(uc:SysUseCase {id:$uid})
                      MERGE (us)-[:REALIZED_BY]->(uc)""", sid=sid, uid=args.id)
             linked_s.append(sid)
+        # --tests: create VERIFIES edges from SysTest nodes to UC's linked features
+        linked_t = []
+        for tid in [x.strip() for x in (getattr(args, "tests", "") or "").split(",") if x.strip()]:
+            # Resolve test node (full path::class::fn or partial match)
+            test_row = s.run(
+                "MATCH (t:SysTest) WHERE t.id = $tid OR t.id ENDS WITH $tid RETURN t.id AS id LIMIT 1",
+                tid=tid
+            ).single()
+            if not test_row:
+                # Create stub test node
+                s.run("MERGE (t:SysTest {id:$tid}) SET t.scannedAt=$now", tid=tid, now=_now_iso())
+                test_row = {"id": tid}
+            # Link to all features required by this UC
+            s.run("""
+                MATCH (uc:SysUseCase {id:$uid})-[:REQUIRES]->(f:SysFeature)
+                MATCH (t:SysTest {id:$tid})
+                MERGE (t)-[:VERIFIES]->(f)
+            """, uid=args.id, tid=test_row["id"])
+            linked_t.append(test_row["id"])
     drv.close()
     for fid in linked_f:
         print(f"✓ {args.id}  →  REQUIRES  →  {fid}")
     for sid in linked_s:
         print(f"✓ {sid}  →  REALIZED_BY  →  {args.id}")
-    if not linked_f and not linked_s:
-        print("Nothing linked — specify --feature and/or --story", file=sys.stderr)
+    for tid in linked_t:
+        print(f"✓ {tid}  →  VERIFIES  →  {args.id} features")
+    if not linked_f and not linked_s and not linked_t:
+        print("Nothing linked — specify --feature, --story, and/or --tests", file=sys.stderr)
+
+
+def cmd_unlink_usecase(args):
+    """Remove stale REQUIRES (UC→Feature) or REALIZED_BY (Story→UC) edges."""
+    drv = _driver()
+    with drv.session() as s:
+        removed = []
+        for fid in [x.strip() for x in (args.feature or "").split(",") if x.strip()]:
+            result = s.run("""
+                MATCH (uc:SysUseCase {id:$uid})-[r:REQUIRES]->(f:SysFeature {id:$fid})
+                DELETE r RETURN count(r) AS n
+            """, uid=args.id, fid=fid).single()
+            if result and result["n"] > 0:
+                removed.append(f"REQUIRES→{fid}")
+            else:
+                print(f"⚠ no REQUIRES edge from {args.id} to {fid}", file=sys.stderr)
+        for sid in [x.strip() for x in (args.story or "").split(",") if x.strip()]:
+            result = s.run("""
+                MATCH (us:SysUserStory {id:$sid})-[r:REALIZED_BY]->(uc:SysUseCase {id:$uid})
+                DELETE r RETURN count(r) AS n
+            """, sid=sid, uid=args.id).single()
+            if result and result["n"] > 0:
+                removed.append(f"{sid}→REALIZED_BY")
+            else:
+                print(f"⚠ no REALIZED_BY edge from {sid} to {args.id}", file=sys.stderr)
+    drv.close()
+    for r in removed:
+        print(f"✓ removed  {args.id}  {r}")
+    if not removed:
+        print("Nothing removed — specify --feature and/or --story", file=sys.stderr)
 
 
 def cmd_start_enhancement(args):
@@ -3803,6 +4002,8 @@ def cmd_show_defect(args):
         print(f"  Instance : {d['instance']}")
     if d.get("source"):
         print(f"  Source   : {d['source']}")
+    if d.get("description"):
+        print(f"\n  {d['description']}")
     if feats:
         print(f"\n  Features :")
         for f in feats:
@@ -3813,6 +4014,25 @@ def cmd_show_defect(args):
     if d.get("occurrences") and int(d["occurrences"]) > 1:
         print(f"  occurrences: {d['occurrences']}")
     print(f"{'═'*62}")
+
+
+def cmd_update_defect(args):
+    """Patch title, description, or severity on a SysDefect node."""
+    drv = _driver()
+    with drv.session() as s:
+        result = s.run("MATCH (d:SysDefect {id:$id}) RETURN d.id AS id", id=args.id).single()
+        if not result:
+            print(f"⚠ {args.id} not found", file=sys.stderr)
+            drv.close(); return
+        if args.title:
+            s.run("MATCH (d:SysDefect {id:$id}) SET d.title=$v", id=args.id, v=args.title)
+        if args.description:
+            s.run("MATCH (d:SysDefect {id:$id}) SET d.description=$v", id=args.id, v=args.description)
+        if args.severity:
+            s.run("MATCH (d:SysDefect {id:$id}) SET d.severity=$v", id=args.id, v=args.severity)
+    drv.close()
+    parts = [p for p in [args.title and "title", args.description and "description", args.severity and "severity"] if p]
+    print(f"✓ {args.id} updated  ({', '.join(parts) or 'no changes'})")
 
 
 def cmd_show_feature_tests(args):
@@ -3920,6 +4140,676 @@ def cmd_retire_feature(args):
         print(f"  Feature will no longer appear in coverage gap reports.")
     else:
         print(f"⚠ {args.id} not found", file=sys.stderr)
+
+
+def _coverage_review_as_req(s, client, model_id, model_name, us_id, uc_id):
+    """AS-REQ dimensional review for a single US or UC."""
+    W = 72
+
+    # Fetch AS-REQ standards
+    stds = s.run(
+        "MATCH (a:SysArchStd) WHERE a.id STARTS WITH 'AS-REQ-' "
+        "RETURN a.id AS id, a.title AS title, a.description AS desc ORDER BY a.id"
+    ).data()
+    if not stds:
+        print("ERROR: No AS-REQ SysArchStd nodes found in graph.", file=sys.stderr)
+        sys.exit(1)
+
+    subject_id = us_id or uc_id
+    context_lines = []
+    uc_rows = []
+
+    if us_id:
+        row = s.run(
+            "MATCH (us:SysUserStory {id:$id}) "
+            "OPTIONAL MATCH (us)-[:REALIZED_BY]->(uc:SysUseCase) "
+            "RETURN us.id AS id, us.title AS title, us.actor AS actor, "
+            "       us.goal AS goal, us.benefit AS benefit, "
+            "       us.acceptanceCriteria AS ac, us.outOfScope AS oos, "
+            "       collect(DISTINCT {id: uc.id, title: uc.title, desc: uc.description, precond: uc.preconditions, mainflow: uc.mainFlow}) AS ucs",
+            id=us_id
+        ).single()
+        if not row:
+            print(f"ERROR: User story {us_id} not found", file=sys.stderr); sys.exit(1)
+        uc_rows = [u for u in (row["ucs"] or []) if u.get("id")]
+
+        # Preflight: flag UCs with null/short descriptions before wasting AI calls
+        thin_ucs = [u["id"] for u in uc_rows if not u.get("desc") or len(u["desc"]) < 50]
+        if thin_ucs:
+            print(f"  ⚠  {subject_id}: {len(thin_ucs)} UC(s) have null/short descriptions "
+                  f"(<50 chars) — AS-REQ results may be unreliable: {', '.join(thin_ucs)}")
+        context_lines = [
+            f"User Story: {row['title']} ({us_id})",
+            f"Actor: {row.get('actor') or 'User'}",
+            f"Goal: {row.get('goal') or ''}",
+        ]
+        if row.get("benefit"):
+            context_lines.append(f"So that: {row['benefit']}")
+        if row.get("ac"):
+            context_lines.append(f"Acceptance criteria: {row['ac']}")
+        if row.get("oos"):
+            context_lines.append(f"Out of scope: {row['oos']}")
+        if uc_rows:
+            uc_summary = "\n".join(
+                f"  [{u['id']}] {u['title']}"
+                + (f"\n    Preconditions: {u['precond']}" if u.get("precond") else "")
+                + (f"\n    Main flow: {u['mainflow']}" if u.get("mainflow") else "")
+                + (f"\n    {u['desc']}" if u.get("desc") else "")
+                for u in uc_rows
+            )
+            context_lines.append(f"\nRealising use cases:\n{uc_summary}")
+        header = f"coverage-review: {us_id}"
+        subtitle = row.get("title", "")
+        uc_ids_str = ", ".join(u["id"] for u in uc_rows) if uc_rows else "(none)"
+
+    elif uc_id:
+        row = s.run(
+            "MATCH (uc:SysUseCase {id:$id}) "
+            "OPTIONAL MATCH (us:SysUserStory)-[:REALIZED_BY]->(uc) "
+            "OPTIONAL MATCH (uc)-[:REQUIRES]->(f:SysFeature) "
+            "OPTIONAL MATCH (t:SysTest)-[:VERIFIES]->(f) "
+            "RETURN uc.id AS id, uc.title AS title, uc.description AS desc, "
+            "       uc.preconditions AS precond, uc.mainFlow AS mainflow, "
+            "       uc.instance AS instance, "
+            "       collect(DISTINCT us.id) AS story_ids, "
+            "       collect(DISTINCT f.id) AS feat_ids, "
+            "       count(DISTINCT t) AS test_count",
+            id=uc_id
+        ).single()
+        if not row:
+            print(f"ERROR: Use case {uc_id} not found", file=sys.stderr); sys.exit(1)
+        context_lines = [
+            f"Use Case: {row['title']} ({uc_id})",
+            f"Instance: {row.get('instance') or 'unknown'}",
+            f"Parent stories: {', '.join(row['story_ids'] or []) or '(none)'}",
+            f"Features: {', '.join(row['feat_ids'] or []) or '(none)'}",
+            f"Linked tests: {row.get('test_count', 0)}",
+        ]
+        if row.get("precond"):
+            context_lines.append(f"Preconditions: {row['precond']}")
+        if row.get("mainflow"):
+            context_lines.append(f"Main flow: {row['mainflow']}")
+        if row.get("desc"):
+            context_lines.append(f"\nDescription:\n{row['desc']}")
+        header = f"coverage-review: {uc_id}"
+        subtitle = row.get("title", "")
+        uc_ids_str = uc_id
+
+    std_block = "\n\n".join(
+        f"### {std['id']} — {std['title']}\n{std['desc']}"
+        for std in stds
+    )
+    context_block = "\n".join(context_lines)
+    mode_desc = "user story's use case set" if us_id else "single use case internal adequacy"
+
+    prompt = f"""You are reviewing requirements adequacy for a {mode_desc}.
+
+## Subject
+{context_block}
+
+## Evaluation Dimensions
+For each AS-REQ dimension below, evaluate the subject and return structured JSON.
+
+{std_block}
+
+Return ONLY a JSON object with this exact structure:
+{{
+  "dimensions": [
+    {{
+      "id": "<standard id e.g. AS-REQ-001>",
+      "status": "PASS" | "WARN" | "FAIL",
+      "finding": "<one specific sentence about what was found or what is missing>",
+      "recommendation": "<if WARN or FAIL: one concrete action; if PASS: empty string>"
+    }}
+  ]
+}}
+
+Rules:
+- PASS: fully satisfied
+- WARN: partially satisfied — something present but incomplete or ambiguous
+- FAIL: clearly absent or clearly wrong
+- finding must be specific (name actual UCs, missing scenarios, ambiguous fields)
+- recommendation must be concrete when status is WARN or FAIL
+- Return raw JSON only, no markdown fences"""
+
+    import re as _re
+
+    def _call_and_parse_req(messages):
+        resp = client.messages.create(model=model_id, max_tokens=2048, messages=messages)
+        raw = resp.content[0].text.strip()
+        m = _re.search(r'\{.*\}', raw, _re.DOTALL)
+        if not m:
+            return None, raw
+        try:
+            return json.loads(m.group()), raw
+        except json.JSONDecodeError:
+            return None, raw
+
+    messages = [{"role": "user", "content": prompt}]
+    result, raw = _call_and_parse_req(messages)
+    if result is None:
+        messages.append({"role": "assistant", "content": raw})
+        messages.append({"role": "user", "content":
+            "Your response was not valid JSON. Return ONLY the JSON object with no text outside it."})
+        result, raw = _call_and_parse_req(messages)
+    if result is None:
+        print(f"  ⚠  {subject_id}: could not parse AI response after retry — skipping",
+              file=sys.stderr)
+        return
+
+    dims = result.get("dimensions", [])
+    pass_count = warn_count = fail_count = 0
+    recs = []
+
+    print(f"\n{'═' * W}")
+    print(f"  {header}")
+    print(f"  {subtitle[:68]}")
+    if us_id and uc_rows:
+        print(f"  UCs: {uc_ids_str}")
+    print(f"  Model: {model_name}")
+    print(f"{'═' * W}\n")
+
+    for d in dims:
+        sid   = d.get("id", "")
+        status = d.get("status", "FAIL").upper()
+        finding = d.get("finding", "")
+        rec     = d.get("recommendation", "")
+        std_title = next((st["title"] for st in stds if st["id"] == sid), sid)
+
+        print(f"  [{status:<4}]  {sid}  {std_title}")
+        if finding:
+            print(f"          {finding[:110]}")
+        if rec:
+            print(f"          → {rec[:108]}")
+        print()
+
+        if status == "PASS":
+            pass_count += 1
+        elif status == "WARN":
+            warn_count += 1
+            if rec:
+                recs.append(f"[{sid}] {rec}")
+        else:
+            fail_count += 1
+            if rec:
+                recs.append(f"[{sid}] {rec}")
+
+    if recs:
+        print(f"{'─' * W}")
+        print(f"  Recommendations")
+        print(f"{'─' * W}")
+        for i, r in enumerate(recs, 1):
+            print(f"  {i}. {r}")
+        print()
+
+    overall = "ALL PASS" if fail_count == 0 and warn_count == 0 else ("NEEDS WORK" if fail_count > 0 else "REVIEW WARNINGS")
+    print(f"{'═' * W}")
+    print(f"  {fail_count} FAIL  ·  {warn_count} WARN  ·  {pass_count} PASS   (overall: {overall})")
+    print(f"{'═' * W}\n")
+
+    # Stamp coverageReviewLastRun + coverageReviewResult on the node
+    result_label = "PASS" if fail_count == 0 and warn_count == 0 else ("FAIL" if fail_count > 0 else "WARN")
+    _stamp_audit(subject_id, "coverageReviewLastRun", "coverageReviewResult", result_label,
+                 uc_id=uc_id, us_id=us_id)
+
+    if fail_count > 0:
+        sys.exit(1)
+
+
+def cmd_audit_test(args):
+    """AI-powered test adequacy audit against AS-TEST architecture standards.
+
+    Evaluates a test file against the applicable tier's AS-TEST-* dimensions.
+    Reads SysArchStd nodes from the graph at runtime — never hardcodes dimension text.
+
+    Usage:
+      audit-test --uc UC-DLG-001 [--file path/to/test.py] [--tier usecase]
+      audit-test --feature F-DLG-001 [--tier integration]
+      audit-test --us US-CTM-010 [--tier e2e]
+    """
+    import os as _os
+
+    uc_id      = getattr(args, "uc",       "") or ""
+    ucs_batch  = getattr(args, "ucs",      "") or ""
+    feat_id    = getattr(args, "feature",  "") or ""
+    us_id      = getattr(args, "us",       "") or ""
+    file_arg   = getattr(args, "file",     "") or ""
+    tier_arg   = getattr(args, "tier",     "") or ""
+    model_name = getattr(args, "model",    "sonnet") or "sonnet"
+    preflight  = getattr(args, "preflight", False)
+
+    # Batch mode: --ucs UC-A,UC-B,UC-C
+    if ucs_batch:
+        uc_ids = [u.strip() for u in ucs_batch.split(",") if u.strip()]
+        any_fail = False
+        for uid in uc_ids:
+            args.uc = uid
+            args.ucs = ""
+            try:
+                cmd_audit_test(args)
+            except SystemExit as e:
+                if e.code != 0:
+                    any_fail = True
+        if any_fail:
+            sys.exit(1)
+        return
+
+    if not (uc_id or feat_id or us_id):
+        print("ERROR: provide --uc, --feature, --us, or --ucs (batch)", file=sys.stderr)
+        sys.exit(1)
+
+    if tier_arg:
+        tier = tier_arg
+    elif uc_id:
+        tier = "usecase"
+    elif feat_id:
+        tier = "integration"
+    else:
+        tier = "e2e"
+
+    tier_prefix = {
+        "usecase":     "AS-TEST-UC-",
+        "integration": "AS-TEST-COMP-",
+        "e2e":         "AS-TEST-US-",
+    }.get(tier, "AS-TEST-UC-")
+
+    tier_label = {
+        "usecase":     "UC / UI Flow",
+        "integration": "Component / Integration",
+        "e2e":         "E2E / User Story",
+    }.get(tier, tier)
+
+    MODEL_IDS = {
+        "haiku":  "claude-haiku-4-5-20251001",
+        "sonnet": "claude-sonnet-4-6",
+    }
+    model_id = MODEL_IDS.get(model_name, MODEL_IDS["sonnet"])
+
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        print("ERROR: pip install anthropic", file=sys.stderr); sys.exit(1)
+
+    api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        print("ERROR: ANTHROPIC_API_KEY not set", file=sys.stderr); sys.exit(1)
+
+    client = _anthropic.Anthropic(api_key=api_key)
+
+    drv = _driver()
+    with drv.session() as s:
+        # Fetch AS-TEST standards for this tier
+        stds = s.run(
+            "MATCH (a:SysArchStd) WHERE a.id STARTS WITH $prefix "
+            "RETURN a.id AS id, a.title AS title, a.description AS desc ORDER BY a.id",
+            prefix=tier_prefix
+        ).data()
+        if not stds:
+            print(f"ERROR: No SysArchStd nodes found with prefix {tier_prefix}", file=sys.stderr)
+            sys.exit(1)
+
+        # Fetch subject context and collect feature IDs for test discovery
+        subject_id = uc_id or feat_id or us_id
+        context_lines = []
+        feature_ids: list[str] = []
+
+        if uc_id:
+            row = s.run(
+                "MATCH (uc:SysUseCase {id:$id}) "
+                "OPTIONAL MATCH (us:SysUserStory)-[:REALIZED_BY]->(uc) "
+                "OPTIONAL MATCH (uc)-[:REQUIRES]->(f:SysFeature) "
+                "RETURN uc.id AS id, uc.title AS title, uc.description AS desc, "
+                "       uc.instance AS instance, "
+                "       collect(DISTINCT us.title) AS stories, "
+                "       collect(DISTINCT f.id) AS feat_ids",
+                id=uc_id
+            ).single()
+            if not row:
+                print(f"ERROR: UC {uc_id} not found", file=sys.stderr); sys.exit(1)
+            feature_ids = [fid for fid in (row["feat_ids"] or []) if fid]
+            context_lines = [
+                f"Use Case: {row['title']} ({uc_id})",
+                f"Instance: {row.get('instance') or 'unknown'}",
+            ]
+            if row.get("stories"):
+                context_lines.append(f"Parent stories: {', '.join(row['stories'])}")
+            if row.get("desc"):
+                context_lines.append(f"\nDescription:\n{row['desc']}")
+
+        elif feat_id:
+            row = s.run(
+                "MATCH (f:SysFeature {id:$id}) "
+                "OPTIONAL MATCH (ep:SysEndpoint)-[:IMPLEMENTS]->(f) "
+                "RETURN f.id AS id, f.name AS name, f.description AS desc, "
+                "       collect(DISTINCT ep.method + ' ' + ep.path) AS endpoints",
+                id=feat_id
+            ).single()
+            if not row:
+                print(f"ERROR: Feature {feat_id} not found", file=sys.stderr); sys.exit(1)
+            feature_ids = [feat_id]
+            context_lines = [f"Feature: {row['name']} ({feat_id})"]
+            if row.get("desc"):
+                context_lines.append(f"Description: {row['desc']}")
+            eps = [e for e in (row.get("endpoints") or []) if e and e.strip() != " "]
+            if eps:
+                context_lines.append(f"Endpoints: {', '.join(eps)}")
+
+        elif us_id:
+            row = s.run(
+                "MATCH (us:SysUserStory {id:$id}) "
+                "OPTIONAL MATCH (us)-[:REALIZED_BY]->(uc:SysUseCase) "
+                "OPTIONAL MATCH (us)-[:REQUIRES]->(f:SysFeature) "
+                "RETURN us.id AS id, us.title AS title, us.actor AS actor, "
+                "       us.goal AS goal, us.benefit AS benefit, "
+                "       us.acceptanceCriteria AS ac, us.outOfScope AS oos, "
+                "       collect(DISTINCT uc.id) AS uc_ids, "
+                "       collect(DISTINCT f.id) AS feat_ids",
+                id=us_id
+            ).single()
+            if not row:
+                print(f"ERROR: User story {us_id} not found", file=sys.stderr); sys.exit(1)
+            feature_ids = [fid for fid in (row["feat_ids"] or []) if fid]
+            context_lines = [
+                f"User Story: {row['title']} ({us_id})",
+                f"Actor: {row.get('actor') or 'User'}",
+                f"Goal: {row.get('goal') or ''}",
+            ]
+            if row.get("benefit"):
+                context_lines.append(f"So that: {row['benefit']}")
+            if row.get("ac"):
+                context_lines.append(f"Acceptance criteria: {row['ac']}")
+            if row.get("oos"):
+                context_lines.append(f"Out of scope: {row['oos']}")
+            if row.get("uc_ids"):
+                context_lines.append(f"Realising use cases: {', '.join(row['uc_ids'])}")
+
+        # Discover test file
+        test_file_path = file_arg
+        if not test_file_path:
+            if feature_ids:
+                test_rows = s.run(
+                    "MATCH (t:SysTest)-[:VERIFIES]->(f:SysFeature) "
+                    "WHERE f.id IN $fids AND t.id CONTAINS '::' "
+                    "RETURN t.id AS tid, t.lastRun AS lr, t.scannedAt AS sa "
+                    "ORDER BY t.lastRun DESC, t.scannedAt DESC",
+                    fids=feature_ids
+                ).data()
+            else:
+                test_rows = []
+
+            if test_rows:
+                # Extract unique file paths (before first ::), preserving order.
+                # Only keep IDs that look like file paths (contain / or end in .py/.go)
+                seen: dict[str, None] = {}
+                for tr in test_rows:
+                    tid = tr["tid"]
+                    if "::" in tid:
+                        fp = tid.split("::")[0]
+                    else:
+                        fp = tid  # bare node ID — may not be a file path
+                    seen[fp] = None
+                test_file_path = next(iter(seen))
+            else:
+                print(f"No tests registered for {subject_id} — run scan-tests first.")
+                drv.close()
+                sys.exit(1)
+
+    drv.close()
+
+    # Resolve test file path
+    p = _root / test_file_path if not test_file_path.startswith("/") else Path(test_file_path)
+
+    # Preflight: show resolved file and exit without running LLM
+    if preflight:
+        if p.exists():
+            print(f"preflight: {subject_id} → {p}  ({'exists' if p.exists() else 'NOT FOUND'})")
+        else:
+            print(f"preflight: {subject_id} → {p}  (NOT FOUND — use --file to override)")
+        return
+
+    if not p.exists():
+        print(f"ERROR: Test file not found: {p}\n"
+              f"  (resolved from graph node: {test_file_path})\n"
+              f"  Use --file <path> to specify the file directly.", file=sys.stderr)
+        sys.exit(1)
+
+    test_content = p.read_text(encoding="utf-8")
+
+    # Build AI prompt
+    std_block = "\n\n".join(
+        f"### {std['id']} — {std['title']}\n{std['desc']}"
+        for std in stds
+    )
+    context_block = "\n".join(context_lines)
+
+    # Truncate very large test files to fit context (keep first 6000 chars + note)
+    if len(test_content) > 6000:
+        test_excerpt = test_content[:6000] + f"\n\n... [truncated — {len(test_content)} chars total]"
+    else:
+        test_excerpt = test_content
+
+    prompt = f"""You are evaluating a test file against architecture standards for {tier_label} tests.
+
+## Subject Under Test
+{context_block}
+
+## Test File: {p.name}
+```python
+{test_excerpt}
+```
+
+## Evaluation Dimensions
+For each dimension below, evaluate the test file content against that dimension's standard.
+
+{std_block}
+
+Return ONLY a JSON object with this exact structure:
+{{
+  "dimensions": [
+    {{
+      "id": "<standard id e.g. AS-TEST-UC-001>",
+      "status": "PASS" | "WARN" | "FAIL",
+      "finding": "<one specific sentence: name actual test functions, classes, or specific gaps found>",
+      "action": "<if WARN or FAIL: one concrete action naming a specific test class, method, or assertion; if PASS: empty string>"
+    }}
+  ]
+}}
+
+Rules:
+- PASS: the test file adequately satisfies this dimension
+- WARN: partially satisfied — something present but incomplete
+- FAIL: clearly absent or clearly incorrect
+- finding must reference actual content in the file (test names, lines, patterns seen or absent)
+- action must be a concrete implementation instruction when status is WARN or FAIL
+- Return raw JSON only, no markdown fences"""
+
+    resp = client.messages.create(
+        model=model_id,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = resp.content[0].text.strip()
+
+    import re as _re
+    json_match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+    if not json_match:
+        print("ERROR: Could not parse AI response as JSON", file=sys.stderr)
+        print(raw, file=sys.stderr)
+        sys.exit(1)
+    try:
+        result = json.loads(json_match.group())
+    except json.JSONDecodeError as e:
+        print(f"ERROR: JSON parse error: {e}", file=sys.stderr)
+        print(raw, file=sys.stderr)
+        sys.exit(1)
+
+    dims = result.get("dimensions", [])
+    W = 72
+    pass_count = warn_count = fail_count = 0
+    actions = []
+
+    print(f"\n{'═' * W}")
+    print(f"  audit-test: {subject_id}  [tier: {tier}]")
+    print(f"  Standards: {tier_prefix}* ({len(stds)} dimensions)  |  Model: {model_name}")
+    print(f"  Test file: {test_file_path}")
+    print(f"{'═' * W}\n")
+
+    for d in dims:
+        sid     = d.get("id", "")
+        status  = d.get("status", "FAIL").upper()
+        finding = d.get("finding", "")
+        action  = d.get("action", "")
+        std_title = next((st["title"] for st in stds if st["id"] == sid), sid)
+
+        print(f"  [{status:<4}]  {sid}  {std_title}")
+        if finding:
+            print(f"          {finding[:110]}")
+        if action:
+            print(f"          → {action[:108]}")
+        print()
+
+        if status == "PASS":
+            pass_count += 1
+        elif status == "WARN":
+            warn_count += 1
+            if action:
+                actions.append(f"[{sid}] {action}")
+        else:
+            fail_count += 1
+            if action:
+                actions.append(f"[{sid}] {action}")
+
+    if actions:
+        print(f"{'─' * W}")
+        print(f"  Action items")
+        print(f"{'─' * W}")
+        for i, a in enumerate(actions, 1):
+            print(f"  {i}. {a}")
+        print()
+
+    overall = ("ALL PASS" if fail_count == 0 and warn_count == 0
+               else "NEEDS WORK" if fail_count > 0 else "REVIEW WARNINGS")
+    print(f"{'═' * W}")
+    print(f"  {fail_count} FAIL  ·  {warn_count} WARN  ·  {pass_count} PASS   (overall: {overall})")
+    print(f"{'═' * W}\n")
+
+    # Stamp auditTestLastRun + auditTestResult on the UC/Feature/US node
+    if uc_id or feat_id or us_id:
+        result_label = "PASS" if fail_count == 0 and warn_count == 0 else ("FAIL" if fail_count > 0 else "WARN")
+        _stamp_audit(subject_id, "auditTestLastRun", "auditTestResult", result_label, uc_id=uc_id, us_id=us_id)
+
+    if fail_count > 0:
+        sys.exit(1)
+
+
+def _stamp_audit(subject_id: str, ts_field: str, result_field: str, result: str,
+                 uc_id: str = "", us_id: str = "") -> None:
+    """Write last-run timestamp and result to the subject node (fire-and-forget)."""
+    try:
+        drv = _driver()
+        now = _now_iso()
+        with drv.session() as s:
+            if uc_id:
+                s.run(f"MATCH (n:SysUseCase {{id:$id}}) SET n.{ts_field}=$now, n.{result_field}=$r",
+                      id=subject_id, now=now, r=result)
+            elif us_id:
+                s.run(f"MATCH (n:SysUserStory {{id:$id}}) SET n.{ts_field}=$now, n.{result_field}=$r",
+                      id=subject_id, now=now, r=result)
+            else:
+                s.run(f"MATCH (n:SysFeature {{id:$id}}) SET n.{ts_field}=$now, n.{result_field}=$r",
+                      id=subject_id, now=now, r=result)
+        drv.close()
+    except Exception:
+        pass  # stamping is non-critical — never block on it
+
+
+def cmd_audit_status(args):
+    """Show last audit-test and coverage-review timestamps per UC/US for an instance.
+
+    Flags items not reviewed in --days (default: 14).
+    """
+    from datetime import datetime, timezone, timedelta
+    instance = getattr(args, "instance", "") or ""
+    days     = getattr(args, "days",     14)  or 14
+    scope    = getattr(args, "scope",    "both") or "both"
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    W = 72
+
+    drv = _driver()
+    with drv.session() as s:
+
+        if scope in ("uc", "both"):
+            if instance:
+                uc_rows = s.run("""
+                    MATCH (uc:SysUseCase {instance:$inst})
+                    RETURN uc.id AS id, uc.title AS title,
+                           uc.auditTestLastRun AS atRun, uc.auditTestResult AS atRes,
+                           uc.coverageReviewLastRun AS crRun, uc.coverageReviewResult AS crRes
+                    ORDER BY uc.id
+                """, inst=instance).data()
+            else:
+                uc_rows = s.run("""
+                    MATCH (uc:SysUseCase)
+                    RETURN uc.id AS id, uc.title AS title,
+                           uc.auditTestLastRun AS atRun, uc.auditTestResult AS atRes,
+                           uc.coverageReviewLastRun AS crRun, uc.coverageReviewResult AS crRes
+                    ORDER BY uc.id
+                """).data()
+
+            stale = [r for r in uc_rows if
+                     not r.get("atRun") or str(r["atRun"]) < cutoff or
+                     not r.get("crRun") or str(r["crRun"]) < cutoff]
+
+            print(f"\n{'═' * W}")
+            print(f"  AUDIT STATUS — Use Cases  ({len(uc_rows)} total · {len(stale)} stale >{days}d)")
+            print(f"{'═' * W}")
+            print(f"  {'UC ID':<20} {'audit-test':>12}  {'result':>6}  {'cov-review':>12}  {'result':>6}")
+            print(f"  {'─'*20} {'─'*12}  {'─'*6}  {'─'*12}  {'─'*6}")
+            for r in uc_rows:
+                at_date = str(r.get("atRun") or "")[:10] or "never"
+                cr_date = str(r.get("crRun") or "")[:10] or "never"
+                at_res  = r.get("atRes") or "—"
+                cr_res  = r.get("crRes") or "—"
+                at_stale = not r.get("atRun") or str(r["atRun"]) < cutoff
+                cr_stale = not r.get("crRun") or str(r["crRun"]) < cutoff
+                at_flag = " ⚠" if at_stale else ""
+                cr_flag = " ⚠" if cr_stale else ""
+                print(f"  {r['id']:<20} {at_date+at_flag:>14}  {at_res:>6}  {cr_date+cr_flag:>14}  {cr_res:>6}")
+
+        if scope in ("us", "both"):
+            if instance:
+                us_rows = s.run("""
+                    MATCH (us:SysUserStory)-[:REALIZED_BY]->(uc:SysUseCase {instance:$inst})
+                    WITH DISTINCT us
+                    RETURN us.id AS id, us.title AS title,
+                           us.coverageReviewLastRun AS crRun, us.coverageReviewResult AS crRes
+                    ORDER BY us.id
+                """, inst=instance).data()
+            else:
+                us_rows = s.run("""
+                    MATCH (us:SysUserStory)
+                    RETURN us.id AS id, us.title AS title,
+                           us.coverageReviewLastRun AS crRun, us.coverageReviewResult AS crRes
+                    ORDER BY us.id
+                """).data()
+
+            stale_us = [r for r in us_rows if
+                        not r.get("crRun") or str(r["crRun"]) < cutoff]
+
+            print(f"\n{'═' * W}")
+            print(f"  AUDIT STATUS — User Stories  ({len(us_rows)} total · {len(stale_us)} stale >{days}d)")
+            print(f"{'═' * W}")
+            print(f"  {'US ID':<20} {'cov-review':>14}  {'result':>6}  Title")
+            print(f"  {'─'*20} {'─'*14}  {'─'*6}  {'─'*40}")
+            for r in us_rows:
+                cr_date = str(r.get("crRun") or "")[:10] or "never"
+                cr_res  = r.get("crRes") or "—"
+                cr_flag = " ⚠" if (not r.get("crRun") or str(r["crRun"]) < cutoff) else ""
+                print(f"  {r['id']:<20} {cr_date+cr_flag:>16}  {cr_res:>6}  {(r['title'] or '')[:40]}")
+
+    drv.close()
+    print()
 
 
 def cmd_coverage_report(args):
@@ -4383,13 +5273,9 @@ def main():
         print()
         sys.exit(0)
 
-    # Warn if not run from the project root (symptoms: .env and scripts/ not found)
-    if not Path("scripts").is_dir() and Path(__file__).parent.name == "scripts":
-        print(
-            f"WARNING: run sys_graph.py from the project root, not '{Path.cwd().name}'. "
-            f"Try:  cd {Path(__file__).parent.parent}",
-            file=sys.stderr,
-        )
+    # Always run from the project root so relative paths work regardless of CWD.
+    # _root is derived from __file__ (absolute), so this is safe from any directory.
+    os.chdir(_root)
 
     p = argparse.ArgumentParser(
         description="System knowledge graph — requirements traceability",
@@ -4447,11 +5333,12 @@ def main():
                     help="Only show ENHs created on or after this date, e.g. 2026-05-20")
 
     sp = sub.add_parser("link-defect", help="Create a defect node and link it to a feature")
-    sp.add_argument("--id",       default="", help="Defect ID, e.g. DEF-001 (auto-assigned if omitted)")
-    sp.add_argument("--feature",  required=True)
-    sp.add_argument("--title",    required=True)
-    sp.add_argument("--severity", default="medium", choices=["critical","high","medium","low"])
-    sp.add_argument("--instance", default="")
+    sp.add_argument("--id",          default="", help="Defect ID, e.g. DEF-001 (auto-assigned if omitted)")
+    sp.add_argument("--feature",     required=True)
+    sp.add_argument("--title",       required=True)
+    sp.add_argument("--description", default="", help="Optional prose description: root cause, repro steps, findings")
+    sp.add_argument("--severity",    default="medium", choices=["critical","high","medium","low"])
+    sp.add_argument("--instance",    default="")
 
     sp = sub.add_parser("close-defect", help="Mark a defect as closed")
     sp.add_argument("--id", required=True)
@@ -4500,10 +5387,16 @@ def main():
     sp.add_argument("--id",      required=True, help="Enhancement ID, e.g. ENH-024")
     sp.add_argument("--feature", required=True, help="Comma-separated feature IDs")
 
-    sp = sub.add_parser("link-usecase", help="Add feature or story links to an existing use case")
+    sp = sub.add_parser("unlink-usecase", help="Remove stale UC→Feature REQUIRES or Story→UC REALIZED_BY edges")
+    sp.add_argument("--id",      required=True, help="Use case ID, e.g. UC-DLG-001")
+    sp.add_argument("--feature", default="",    help="Comma-separated feature IDs to unlink")
+    sp.add_argument("--story",   default="",    help="Comma-separated story IDs to remove REALIZED_BY from")
+
+    sp = sub.add_parser("link-usecase", help="Add feature, story, or test links to an existing use case")
     sp.add_argument("--id",      required=True, help="Use case ID, e.g. UC-AUTH-001")
     sp.add_argument("--feature", default="", help="Comma-separated SysFeature IDs → REQUIRES")
     sp.add_argument("--story",   default="", help="Comma-separated SysUserStory IDs → REALIZED_BY")
+    sp.add_argument("--tests",   default="", help="Comma-separated SysTest IDs → VERIFIES UC's features")
 
     sp = sub.add_parser("close-enhancement", help="Mark an enhancement as done")
     sp.add_argument("--id",       required=True, help="Enhancement ID, e.g. ENH-024")
@@ -4512,6 +5405,10 @@ def main():
                     help="Comma-sep entity types to verify exist in graph (e.g. SysFeature,SysUseCase)")
     sp.add_argument("--skip-checklist", action="store_true",
                     help="Suppress the pre-close checklist reminder")
+    sp.add_argument("--graph-only", action="store_true",
+                    help="Enhancement made no code changes — skip endpoint/symbol/test checklist")
+    sp.add_argument("--test-only",  action="store_true",
+                    help="Enhancement added tests only — skip endpoint/symbol checklist items")
 
     sp = sub.add_parser("reconcile-done",
                         help=argparse.SUPPRESS)
@@ -4529,6 +5426,12 @@ def main():
 
     sp = sub.add_parser("show-defect", help="Display full details of a defect")
     sp.add_argument("--id", required=True, help="Defect ID, e.g. DEF-042")
+
+    sp = sub.add_parser("update-defect", help="Patch title, description, or severity on a defect")
+    sp.add_argument("--id",          required=True, help="Defect ID, e.g. DEF-042")
+    sp.add_argument("--title",       default="", help="New title")
+    sp.add_argument("--description", default="", help="New or updated description")
+    sp.add_argument("--severity",    default="", choices=["","critical","high","medium","low"])
 
     # ── Proposals ─────────────────────────────────────────────────────────────
     sp = sub.add_parser("create-proposal",
@@ -4607,6 +5510,31 @@ def main():
                     help="Claude model to use (default: haiku — cheaper for large scopes)")
     sp.add_argument("--file-proposals", action="store_true", dest="file_proposals",
                     help="Create SysProposal nodes for every GAP finding")
+    sp.add_argument("--us",       default="",
+                    help="Single US id — runs AS-REQ dimensional review (e.g. US-CTM-010)")
+    sp.add_argument("--uc",       default="",
+                    help="Single UC id — runs AS-REQ internal adequacy review (e.g. UC-DLG-001)")
+
+    sp = sub.add_parser("audit-status",
+                        help="Show last audit-test and coverage-review timestamps per UC/US")
+    sp.add_argument("--instance", default="", help="Filter to one instance's UCs/USs")
+    sp.add_argument("--days",     type=int, default=14, help="Flag items older than N days (default: 14)")
+    sp.add_argument("--scope",    default="both", choices=["uc","us","both"],
+                    help="Show use cases, user stories, or both (default: both)")
+
+    sp = sub.add_parser("audit-test",
+                        help="AI test adequacy audit against AS-TEST architecture standards")
+    sp.add_argument("--uc",       default="", help="Use case id, e.g. UC-DLG-001 (default tier: usecase)")
+    sp.add_argument("--ucs",      default="", help="Comma-separated UC ids for batch mode, e.g. UC-A,UC-B")
+    sp.add_argument("--feature",  default="", help="Feature id, e.g. F-DLG-001 (default tier: integration)")
+    sp.add_argument("--us",       default="", help="User story id, e.g. US-CTM-010 (default tier: e2e)")
+    sp.add_argument("--file",     default="", help="Override test file path (else auto-discovered from graph)")
+    sp.add_argument("--tier",     default="", choices=["", "usecase", "integration", "e2e"],
+                    help="Override tier: usecase | integration | e2e")
+    sp.add_argument("--model",    default="sonnet", choices=["haiku", "sonnet"],
+                    help="Claude model to use (default: sonnet)")
+    sp.add_argument("--preflight", action="store_true",
+                    help="Show which test file would be used without running the LLM audit")
 
     sp = sub.add_parser("link-blocks", help="Mark one enhancement as BLOCKED_BY another")
     sp.add_argument("--id",         required=True, help="Enhancement that is blocked, e.g. ENH-042")
@@ -4776,6 +5704,10 @@ def main():
     sp.add_argument("--id",   required=True, help="Comma-separated FB-IDs, e.g. FB-002,FB-004")
     sp.add_argument("--note", default="",    help="Optional note on how it was actioned")
 
+    sp = sub.add_parser("feedback-summary", help="Per-instance feedback recency report")
+    sp.add_argument("--days", type=int, default=7,
+                    help="Flag instances silent longer than this many days (default: 7)")
+
 
     sp = sub.add_parser("scan-go-tests",
                         help="Scan Go *_test.go files and register as component-category SysTest nodes")
@@ -4889,6 +5821,7 @@ def main():
         "start-enhancement":  cmd_start_enhancement,
         "show-enhancement":   cmd_show_enhancement,
         "show-defect":        cmd_show_defect,
+        "update-defect":      cmd_update_defect,
         "create-proposal":    cmd_create_proposal,
         "show-proposal":      cmd_show_proposal,
         "update-proposal":    cmd_update_proposal,
@@ -4897,6 +5830,7 @@ def main():
         "show-notes":         cmd_show_notes,
         "expire-note":        cmd_expire_note,
         "link-usecase":       cmd_link_usecase,
+        "unlink-usecase":     cmd_unlink_usecase,
         "link-story":          cmd_link_story,
         "show-feature-tests":  cmd_show_feature_tests,
         "retire-feature":      cmd_retire_feature,
@@ -4904,6 +5838,8 @@ def main():
         "migrate-binary":      _upgrade,
         "coverage-report":     cmd_coverage_report,
         "coverage-review":     _upgrade,
+        "audit-status":        cmd_audit_status,
+        "audit-test":          cmd_audit_test,
         "preview-import":  _upgrade,
         "commit-import":   _upgrade,
         "create-usecase":  cmd_create_usecase,
@@ -4933,8 +5869,9 @@ def main():
         "scenarios":      cmd_scenarios,
         "seed-standards": _upgrade,
         "feedback":       cmd_feedback,
-        "show-feedback":  cmd_show_feedback,
-        "ack-feedback":   cmd_ack_feedback,
+        "show-feedback":     cmd_show_feedback,
+        "ack-feedback":      cmd_ack_feedback,
+        "feedback-summary":  cmd_feedback_summary,
     }
     try:
         dispatch[args.cmd](args)

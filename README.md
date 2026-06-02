@@ -86,12 +86,17 @@ The **Bootstrap Kit** includes `/init-sysedge` — a Claude Code skill that scan
 |---|---|
 | `briefing --instance X` | Coverage by module, open enhancements, defects (30 seconds) |
 | `worklog --instance X` | Prioritised work queue for this session |
-| `test-gaps --instance X` | Missing test tiers per feature |
+| `test-gaps --instance X` | Missing test tiers per feature (e2e suppressed for non-master) |
 | `start-enhancement --id ENH-X --instance X` | Mark in-progress — visible to all sessions |
-| `close-enhancement --id ENH-X --instance X` | Mark done, prints CONTEXT.md reminder |
+| `close-enhancement --id ENH-X --instance X` | Mark done — smart checklist, `--graph-only` / `--test-only` to suppress code items |
 | `show-enhancement --id ENH-X` | Full description + linked features |
 | `create-enhancement --title "..." --instance X --priority Must` | File new work item |
+| `link-defect --feature F-X --title "..." --severity high --instance X` | File a defect before fixing it |
+| `update-defect --id DEF-X --description "..."` | Add root cause / investigation notes to a defect |
+| `link-usecase --id UC-X --feature F-X --story US-X --tests test.py::Class::fn` | Wire UC edges (features, stories, tests) |
+| `unlink-usecase --id UC-X --feature F-X` | Remove stale UC→Feature REQUIRES edge |
 | `link-endpoint --feature F-X --method GET --path /api/...` | Link endpoint to feature |
+| `audit-status --instance X` | Last audit-test + coverage-review timestamps per UC/US — flags stale |
 | `backup` | Export full graph to JSON |
 | `seed backup.json --instance X` | Restore only your instance's nodes (safe) |
 
@@ -156,7 +161,7 @@ SysEdge enforces the V-model. Each spec artefact has a required test artefact:
 
 **Free (this repo):** CLI, skill file, Docker Compose setup, patterns — everything in this README.
 
-**$149/repository** — [Bootstrap Kit](https://www.org-edge.com/sysedge.html): web visualiser, `/init-sysedge` auto-seed skill, architecture standards catalogue (53 standards), AI traceability review, export and analysis commands, session templates, 12 months updates and email support.
+**$149/repository** — [Bootstrap Kit](https://www.org-edge.com/sysedge.html): web visualiser, `/init-sysedge` auto-seed skill, architecture standards catalogue (53 standards), AI test quality audit (`audit-test` — evaluates test files against 7 AS-TEST dimensions), AI requirements adequacy review (`coverage-review --uc/--us` — evaluates UC specs against 7 AS-REQ dimensions), graph analysis, export and analysis commands, session templates, 12 months updates and email support.
 
 ---
 
