@@ -191,6 +191,63 @@ def _require_licence(command: str = "") -> None:
         sys.exit(0)
 
 
+_AI_MODELS = {
+    "haiku":  "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6",
+}
+
+
+def _ai_call(prompt: str, model: str = "haiku", max_tokens: int = 2048) -> str:
+    """Send a prompt to Claude and return the text response.
+
+    Priority:
+      1. claude CLI  — uses the current Claude Code session tokens (no API key needed)
+      2. anthropic package + ANTHROPIC_API_KEY  — direct API fallback
+
+    Raises RuntimeError if neither is available.
+    """
+    import subprocess as _sp
+    import os as _os
+
+    model_id = _AI_MODELS.get(model, _AI_MODELS["haiku"])
+
+    # ── 1. Try claude CLI (Claude Code session tokens) ─────────────────────
+    try:
+        result = _sp.run(
+            ["claude", "-p", prompt, "--output-format", "json", "--model", model_id],
+            capture_output=True, text=True, timeout=180,
+            cwd="/tmp",  # avoid loading project CLAUDE.md context
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout)
+            text = data.get("result", "")
+            if text:
+                return text
+    except Exception:
+        pass
+
+    # ── 2. Fall back to anthropic package + ANTHROPIC_API_KEY ──────────────
+    api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            "No AI provider available.\n"
+            "  (a) Run inside a Claude Code session — uses session tokens automatically, or\n"
+            "  (b) Set ANTHROPIC_API_KEY in your .env file"
+        )
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=model_id, max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.content[0].text.strip()
+    except ImportError:
+        raise RuntimeError(
+            "pip install anthropic  (or run inside a Claude Code session)"
+        )
+
+
 def _alloc_id(session, label: str, prefix: str, pad: int = 0) -> str:
     """Allocate the next sequential id for a Sys* node, retrying on collision.
 
@@ -1959,16 +2016,57 @@ def _derive_module_from_dir(file_path: str, dir_mappings: list | None = None) ->
     return ""
 
 
+def _read_pytestmark(file_path: str) -> str:
+    """Read module-level pytestmark from a Python test file via AST.
+
+    Returns the mark tier ('usecase', 'integration', 'component', 'e2e') or ''.
+    Looks for: pytestmark = pytest.mark.<tier>
+    """
+    _MARK_TO_TIER = {
+        "usecase": "usecase", "ui": "usecase", "ui_flow": "usecase",
+        "integration": "integration", "api": "integration", "functional": "integration",
+        "component": "component", "unit": "component",
+        "e2e": "e2e", "end_to_end": "e2e",
+    }
+    if not file_path or not file_path.endswith(".py"):
+        return ""
+    try:
+        source = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source)
+    except Exception:
+        return ""
+    for node in tree.body:
+        # pytestmark = pytest.mark.X  or  pytestmark = [pytest.mark.X, ...]
+        if not isinstance(node, ast.Assign):
+            continue
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name) and tgt.id == "pytestmark":
+                val = node.value
+                # Single mark: pytest.mark.X
+                if isinstance(val, ast.Attribute) and isinstance(val.value, ast.Attribute):
+                    mark_name = val.attr
+                    if mark_name in _MARK_TO_TIER:
+                        return _MARK_TO_TIER[mark_name]
+                # List of marks: [pytest.mark.X, ...]
+                if isinstance(val, ast.List):
+                    for elt in val.elts:
+                        if isinstance(elt, ast.Attribute) and elt.attr in _MARK_TO_TIER:
+                            return _MARK_TO_TIER[elt.attr]
+    return ""
+
+
 def _derive_test_category(test_type: str, file_path: str = "",
                            explicit: str = "",
                            dir_mappings: list | None = None) -> str:
     """Derive testCategory in priority order:
 
     1. Explicit override (--category flag)
-    2. Graph-stored SysDirCategory mappings (longest prefix + pattern match)
-    3. testType field heuristics
-    4. Filename heuristics
-    5. Safe default: 'integration'
+    2. Unambiguous filename patterns (test_e2e_*.py → e2e)
+    3. Module-level pytestmark (pytestmark = pytest.mark.usecase → usecase)
+    4. Graph-stored SysDirCategory mappings (longest prefix + pattern match)
+    5. testType field heuristics
+    6. Filename heuristics
+    7. Safe default: 'integration'
     """
     if explicit:
         return explicit
@@ -1981,6 +2079,23 @@ def _derive_test_category(test_type: str, file_path: str = "",
     # test_e2e_*.py is always e2e regardless of dir category.
     if fnl.startswith("test_e2e_"):
         return "e2e"
+
+    # Module-level pytestmark takes priority over dir-mappings (ENH-897 / FB-271).
+    # Reads AST — only attempted for .py files; silent on parse error.
+    mark_tier = _read_pytestmark(fp)
+    if mark_tier:
+        # Warn if dir-mapping would have given a different answer
+        if dir_mappings:
+            for m in dir_mappings:
+                if fp.startswith(m["prefix"]):
+                    pat = m["pattern"]
+                    if not pat or pat in fn:
+                        dir_cat = m["category"]
+                        if dir_cat != mark_tier:
+                            print(f"  ⚠  pytestmark.{mark_tier} overrides dir-mapping "
+                                  f"'{dir_cat}' for {fn}", file=sys.stderr)
+                        break
+        return mark_tier
 
     # Graph directory mappings (loaded once per scan run)
     if dir_mappings:
@@ -2614,19 +2729,28 @@ def cmd_test_gaps(args):
 
         # Build feature → {component, integration, usecase} coverage map
         all_fids = list({r["fid"] for r in mod_rows})
+        # ENH-899: match briefing's coverage logic — testType OR package.testCategory
+        # Both paths must use the same criteria to avoid contradictory results.
         cov_data = s.run("""
             UNWIND $fids AS fid
             MATCH (f:SysFeature {id:fid})
-            OPTIONAL MATCH (pkg1:SysTestPackage {testCategory:'component'})-[:CONTAINS_TEST]->(tc:SysTest)-[:VERIFIES]->(f)
-            OPTIONAL MATCH (pkg2:SysTestPackage {testCategory:'integration'})-[:CONTAINS_TEST]->(ti:SysTest)-[:VERIFIES]->(f)
-            OPTIONAL MATCH (pkg3:SysTestPackage {testCategory:'usecase'})-[:CONTAINS_TEST]->(tu:SysTest)-[:VERIFIES]->(f)
+            OPTIONAL MATCH (tc:SysTest)-[:VERIFIES]->(f)
+            WHERE (tc.testType IN ['component','go-unit'])
+               OR exists((:SysTestPackage {testCategory:'component'})-[:CONTAINS_TEST]->(tc))
+            OPTIONAL MATCH (ti:SysTest)-[:VERIFIES]->(f)
+            WHERE (ti.testType = 'integration')
+               OR exists((:SysTestPackage {testCategory:'integration'})-[:CONTAINS_TEST]->(ti))
+            OPTIONAL MATCH (tu:SysTest)-[:VERIFIES]->(f)
+            WHERE (tu.testType = 'usecase')
+               OR exists((:SysTestPackage {testCategory:'usecase'})-[:CONTAINS_TEST]->(tu))
+            OPTIONAL MATCH (te:SysTest)-[:VERIFIES]->(f)
+            WHERE (te.testType = 'e2e')
+               OR exists((:SysTestPackage {testCategory:'e2e'})-[:CONTAINS_TEST]->(te))
             RETURN fid,
                    count(DISTINCT tc) AS cmp,
                    count(DISTINCT ti) AS int_,
                    count(DISTINCT tu) AS uc,
-                   collect(DISTINCT pkg1.id) AS cmpPkgs,
-                   collect(DISTINCT pkg2.id) AS intPkgs,
-                   collect(DISTINCT pkg3.id) AS ucPkgs
+                   count(DISTINCT te) AS e2e
         """, fids=all_fids).data()
         cov_map = {r["fid"]: r for r in cov_data}
 
@@ -2828,6 +2952,7 @@ def cmd_worklog(args):
                    e.status AS status,
                    coalesce(e.priority,'Should') AS priority,
                    e.description AS desc,
+                   e.deployChecklist AS deployChecklist,
                    features, blockers
             ORDER BY
               CASE e.status
@@ -2974,6 +3099,11 @@ def cmd_worklog(args):
                                 print(f"     Code    : {p}")
                 else:
                     print(f"     Feature : (not yet linked — use link-enhancement)")
+                # Deploy checklist — shown for in-progress enhancements
+                if e.get("deployChecklist") and e.get("status") == "in-progress":
+                    print(f"     Deploy:")
+                    for line in e["deployChecklist"].splitlines():
+                        print(f"       {line}")
                 # ENH-547: blocked-by visibility
                 active_blockers = [b for b in (e.get("blockers") or [])
                                    if b.get("bid") and b.get("bst") not in ("done", None)]
@@ -3174,13 +3304,15 @@ def cmd_reconcile_done(args):
             print(f"    symbols   : {fa['sym_count']:3d}  {sym_mark}{'  ← no CONTAINS_SYMBOL edges — run scan-code or link-symbol' if fa['sym_count']==0 else ''}")
 
         # UC/US prose review — ENH-553: filter to caller instance; ENH-551: note when all filtered
+        # ENH-901: --skip-uc-check suppresses when defect was env/test-bug not a behaviour change
+        skip_uc = getattr(args, "skip_uc_check", False)
         all_ucs_raw = [uc for fa in feature_analysis for uc in fa["ucs"]]
         all_ucs = [uc for uc in all_ucs_raw
                    if not caller or not uc.get("ucinst") or uc["ucinst"] == caller]
         filtered_out = len(all_ucs_raw) - len(all_ucs)
 
         seen_ucs: set = set()
-        if all_ucs:
+        if all_ucs and not skip_uc:
             print(f"\n{'─'*W}")
             print(f"  USE CASES & USER STORIES — review prose for accuracy")
             print(f"  Enhancement context: {description[:120].strip()}{'...' if len(description)>120 else ''}")
@@ -3301,6 +3433,7 @@ def cmd_close_defect(args):
     # Trigger reconciliation
     class _A: pass
     a = _A(); a.id = ""; a.defect = args.id; a.instance = ""
+    a.skip_uc_check = getattr(args, "skip_uc_check", False)
     cmd_reconcile_done(a)
 
 
@@ -3370,34 +3503,14 @@ def cmd_quality_review(args):
       quality-review --entity US-CTM-010 --ai  (enable AI evaluation of guidance standards)
       quality-review --instance manage --type SysUseCase [--ai]
     """
-    import os as _os
-
     entity_id   = getattr(args, "entity",   "") or ""
     instance    = getattr(args, "instance", "") or ""
     type_filter = getattr(args, "type",     "") or ""
     ai_mode     = getattr(args, "ai",       False)
     model_name  = getattr(args, "model",    "haiku") or "haiku"
 
-    MODEL_IDS = {"haiku": "claude-haiku-4-5-20251001", "sonnet": "claude-sonnet-4-6"}
-    model_id  = MODEL_IDS.get(model_name, MODEL_IDS["haiku"])
-
     if not entity_id and not instance:
         print("ERROR: provide --entity or --instance", file=sys.stderr); sys.exit(1)
-
-    ai_client = None
-    if ai_mode:
-        try:
-            import anthropic as _anthropic
-            api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
-            if not api_key:
-                print("WARNING: --ai requires ANTHROPIC_API_KEY — AI standards will be skipped",
-                      file=sys.stderr)
-                ai_mode = False
-            else:
-                ai_client = _anthropic.Anthropic(api_key=api_key)
-        except ImportError:
-            print("WARNING: pip install anthropic for --ai mode", file=sys.stderr)
-            ai_mode = False
 
     W = 72
     drv = _driver()
@@ -3561,7 +3674,7 @@ def cmd_quality_review(args):
                         suggest_total += 1
 
                 elif method == "ai":
-                    if ai_mode and ai_client:
+                    if ai_mode:
                         deferred_ai.append(std)
                     else:
                         label = "[AI]   " if not ai_mode else "[AI]   "
@@ -3576,7 +3689,7 @@ def cmd_quality_review(args):
                         review_total += 1
 
             # ── AI evaluation for guidance+ai standards ────────────────────
-            if deferred_ai and ai_client:
+            if deferred_ai:
                 for std in deferred_ai:
                     sid   = std["id"]
                     tbadge = f"[{(std.get('tier') or 'def')[:3]}]"
@@ -3588,11 +3701,7 @@ def cmd_quality_review(args):
                         f"Return exactly one line: SCORE: GOOD|WEAK|POOR — one sentence reasoning."
                     )
                     try:
-                        resp = ai_client.messages.create(
-                            model=model_id, max_tokens=128,
-                            messages=[{"role":"user","content":prompt}]
-                        )
-                        reply = resp.content[0].text.strip()
+                        reply = _ai_call(prompt, model_name, max_tokens=128)
                         score = "POOR"
                         for v in ("GOOD","WEAK","POOR"):
                             if v in reply.upper(): score = v; break
@@ -3982,15 +4091,20 @@ def cmd_create_enhancement(args):
     drv = _driver()
     with drv.session() as s:
         enh_id = _alloc_id(s, "SysEnhancement", "ENH-")
-        # Warn if title collision
-        dupe = s.run("""
+        # Fuzzy duplicate detection: token overlap >= 50% among open enhancements
+        open_enhs = s.run("""
             MATCH (e:SysEnhancement)
-            WHERE toLower(e.title) = toLower($title)
-            RETURN e.id AS id LIMIT 1
-        """, title=args.title).single()
-        if dupe:
-            print(f"⚠  Possible duplicate: '{args.title}' matches {dupe['id']} — check before proceeding",
-                  file=sys.stderr)
+            WHERE e.status <> 'done' AND e.instance = $inst
+            RETURN e.id AS id, e.title AS title
+        """, inst=args.instance).data()
+        new_words = set((args.title or "").lower().split())
+        for ex in open_enhs:
+            old_words = set((ex["title"] or "").lower().split())
+            if new_words and old_words:
+                overlap = len(new_words & old_words) / max(len(new_words | old_words), 1)
+                if overlap >= 0.5:
+                    print(f"  ⚠  Possible duplicate: {ex['id']} has {int(overlap*100)}% title overlap: "
+                          f'"{ex["title"]}"', file=sys.stderr)
         s.run("""
             MATCH (e:SysEnhancement {id: $id})
             SET e.title=$title, e.description=$desc,
@@ -4022,9 +4136,10 @@ def cmd_update_enhancement(args):
         if args.description: updates["description"] = args.description
         if args.priority:    updates["priority"]    = args.priority
         if args.source:      updates["source"]      = args.source
-        if getattr(args, "instance", ""): updates["instance"] = args.instance
+        if getattr(args, "instance",         ""): updates["instance"]         = args.instance
+        if getattr(args, "deploy_checklist", ""): updates["deployChecklist"]  = args.deploy_checklist
         if not updates:
-            print("Nothing to update — specify at least one of --title --description --priority --source --instance",
+            print("Nothing to update — specify at least one of --title --description --priority --source --instance --deploy-checklist",
                   file=sys.stderr); drv.close(); return
         set_clause = ", ".join(f"e.{k}=${k}" for k in updates)
         s.run(f"MATCH (e:SysEnhancement {{id:$id}}) SET {set_clause}",
@@ -4050,6 +4165,51 @@ def cmd_update_feature(args):
         s.run(f"MATCH (f:SysFeature {{id:$id}}) SET {set_clause}", id=args.id, **updates)
     drv.close()
     print(f"✓ {args.id} updated: {', '.join(updates.keys())}")
+
+
+def cmd_show_usecase(args):
+    """Display full details of a SysUseCase by ID."""
+    drv = _driver()
+    with drv.session() as s:
+        result = s.run("""
+            MATCH (uc:SysUseCase {id:$id})
+            OPTIONAL MATCH (us:SysUserStory)-[:REALIZED_BY]->(uc)
+            OPTIONAL MATCH (uc)-[:REQUIRES]->(f:SysFeature)
+            OPTIONAL MATCH (t:SysTest)-[:VERIFIES]->(f)
+            RETURN uc { .* } AS ucnode,
+                   collect(DISTINCT {sid:us.id, stitle:us.title}) AS stories,
+                   collect(DISTINCT f.id) AS feat_ids,
+                   count(DISTINCT t) AS test_count
+        """, id=args.id).single()
+    drv.close()
+    if not result:
+        print(f"⚠ {args.id} not found", file=sys.stderr); return
+    uc = result["ucnode"]
+    stories = [s for s in result["stories"] if s.get("sid")]
+    print(f"\n{'═'*66}")
+    print(f"  {uc['id']}  [{uc.get('instance','')}]  [{uc.get('priority','?')}]")
+    print(f"  {uc.get('title','')}")
+    print(f"{'─'*66}")
+    if stories:
+        print(f"  Parent stories  : {', '.join(s['sid'] for s in stories)}")
+    if result["feat_ids"]:
+        print(f"  Features        : {', '.join(result['feat_ids'])}")
+    print(f"  Linked tests    : {result['test_count']} (via UC→Feature←Test)")
+    for field, label in [
+        ("authorizedRoles",  "Auth roles"),
+        ("failureScenarios", "Failure scenarios"),
+        ("preconditions",    "Preconditions"),
+        ("mainFlow",         "Main flow"),
+        ("postconditions",   "Postconditions"),
+        ("description",      "Description"),
+        ("wizardBased",      "Wizard"),
+        ("coverageReviewLastRun",  "Coverage review"),
+        ("auditTestLastRun",       "Audit test"),
+    ]:
+        val = uc.get(field)
+        if val is not None and val != "":
+            print(f"\n  {label}:\n  {val}")
+    print(f"{'═'*66}")
 
 
 def cmd_update_usecase(args):
@@ -4253,6 +4413,10 @@ def cmd_show_enhancement(args):
         print(f"\n  Features :")
         for f in feats:
             print(f"    {f['fid']}  {f.get('fname','')}  [{f.get('mid','')}]")
+    if e.get("deployChecklist"):
+        print(f"\n  Deploy checklist:")
+        for line in e["deployChecklist"].splitlines():
+            print(f"    {line}")
     for ts_field in ("createdAt","startedAt","completedAt"):
         if e.get(ts_field):
             print(f"  {ts_field:<12}: {str(e[ts_field])[:19]}")
@@ -4583,7 +4747,7 @@ def cmd_retire_feature(args):
         print(f"⚠ {args.id} not found", file=sys.stderr)
 
 
-def _coverage_review_as_req(s, client, model_id, model_name, us_id, uc_id):
+def _coverage_review_as_req(s, model_name, us_id, uc_id):
     """AS-REQ dimensional review for a single US or UC."""
     W = 72
 
@@ -4747,25 +4911,62 @@ Rules:
 - Return raw JSON only, no markdown fences"""
 
     import re as _re
+    import hashlib as _hashlib
 
-    def _call_and_parse_req(messages):
-        resp = client.messages.create(model=model_id, max_tokens=2048, messages=messages)
-        raw = resp.content[0].text.strip()
-        m = _re.search(r'\{.*\}', raw, _re.DOTALL)
-        if not m:
-            return None, raw
+    # ENH-900: cache result keyed on hash of prompt content (entity + standards)
+    # Stored on the UC/US node as coverageReviewCacheKey + coverageReviewCacheData
+    cache_key = _hashlib.sha256(prompt.encode()).hexdigest()[:16]
+
+    def _load_cache(session, entity_id, node_label):
+        row = session.run(
+            f"MATCH (n:{node_label} {{id:$id}}) "
+            "RETURN n.coverageReviewCacheKey AS k, n.coverageReviewCacheData AS d",
+            id=entity_id
+        ).single()
+        if row and row["k"] == cache_key and row["d"]:
+            try:
+                return json.loads(row["d"])
+            except Exception:
+                pass
+        return None
+
+    def _store_cache(session, entity_id, node_label, result_obj):
         try:
-            return json.loads(m.group()), raw
-        except json.JSONDecodeError:
-            return None, raw
+            session.run(
+                f"MATCH (n:{node_label} {{id:$id}}) "
+                "SET n.coverageReviewCacheKey=$k, n.coverageReviewCacheData=$d",
+                id=entity_id, k=cache_key, d=json.dumps(result_obj)
+            )
+        except Exception:
+            pass
 
-    messages = [{"role": "user", "content": prompt}]
-    result, raw = _call_and_parse_req(messages)
-    if result is None:
-        messages.append({"role": "assistant", "content": raw})
-        messages.append({"role": "user", "content":
-            "Your response was not valid JSON. Return ONLY the JSON object with no text outside it."})
-        result, raw = _call_and_parse_req(messages)
+    # Check cache first
+    cache_label = "SysUseCase" if uc_id else "SysUserStory"
+    cache_entity = uc_id or us_id
+    cached = _load_cache(s, cache_entity, cache_label)
+    if cached:
+        result = cached
+        print(f"  (using cached result — run with updated UC/US content to refresh)")
+    else:
+
+        def _call_and_parse_req(prompt_text):
+            raw = _ai_call(prompt_text, model_name, max_tokens=2048)
+            m = _re.search(r'\{.*\}', raw, _re.DOTALL)
+            if not m:
+                return None, raw
+            try:
+                return json.loads(m.group()), raw
+            except json.JSONDecodeError:
+                return None, raw
+
+        result, raw = _call_and_parse_req(prompt)
+        if result is None:
+            retry_prompt = prompt + "\n\nIMPORTANT: Return ONLY the JSON object with no text outside it."
+            result, raw = _call_and_parse_req(retry_prompt)
+
+        if result is not None:
+            _store_cache(s, cache_entity, cache_label, result)
+
     if result is None:
         print(f"  ⚠  {subject_id}: could not parse AI response after retry — skipping",
               file=sys.stderr)
@@ -4841,8 +5042,6 @@ def cmd_audit_test(args):
       audit-test --feature F-DLG-001 [--tier integration]
       audit-test --us US-CTM-010 [--tier e2e]
     """
-    import os as _os
-
     uc_id      = getattr(args, "uc",       "") or ""
     ucs_batch  = getattr(args, "ucs",      "") or ""
     feat_id    = getattr(args, "feature",  "") or ""
@@ -4892,23 +5091,6 @@ def cmd_audit_test(args):
         "integration": "Component / Integration",
         "e2e":         "E2E / User Story",
     }.get(tier, tier)
-
-    MODEL_IDS = {
-        "haiku":  "claude-haiku-4-5-20251001",
-        "sonnet": "claude-sonnet-4-6",
-    }
-    model_id = MODEL_IDS.get(model_name, MODEL_IDS["sonnet"])
-
-    try:
-        import anthropic as _anthropic
-    except ImportError:
-        print("ERROR: pip install anthropic", file=sys.stderr); sys.exit(1)
-
-    api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY not set", file=sys.stderr); sys.exit(1)
-
-    client = _anthropic.Anthropic(api_key=api_key)
 
     drv = _driver()
     with drv.session() as s:
@@ -5005,23 +5187,52 @@ def cmd_audit_test(args):
             if row.get("uc_ids"):
                 context_lines.append(f"Realising use cases: {', '.join(row['uc_ids'])}")
 
-        # Discover test file
+        # Discover test file — prefer tier-matching package over highest VERIFIES count (ENH-898)
         test_file_path = file_arg
         if not test_file_path:
             if feature_ids:
-                test_rows = s.run(
+                # Map audit tier to SysTestPackage testCategory values
+                _TIER_CATS = {
+                    "usecase":     ["usecase", "ui", "ui_flow"],
+                    "integration": ["integration", "api", "functional"],
+                    "e2e":         ["e2e", "end_to_end"],
+                    "component":   ["component", "unit"],
+                }
+                preferred_cats = _TIER_CATS.get(tier, [])
+
+                # Pass 1: tier-matching packages only
+                if preferred_cats:
+                    tier_rows = s.run(
+                        "MATCH (t:SysTest)-[:VERIFIES]->(f:SysFeature) "
+                        "WHERE f.id IN $fids AND t.id CONTAINS '::' "
+                        "MATCH (pkg:SysTestPackage)-[:CONTAINS_TEST]->(t) "
+                        "WHERE pkg.testCategory IN $cats "
+                        "RETURN t.id AS tid, t.lastRun AS lr, t.scannedAt AS sa "
+                        "ORDER BY t.lastRun DESC, t.scannedAt DESC",
+                        fids=feature_ids, cats=preferred_cats
+                    ).data()
+                else:
+                    tier_rows = []
+
+                # Pass 2: any test file (fallback)
+                test_rows = tier_rows or s.run(
                     "MATCH (t:SysTest)-[:VERIFIES]->(f:SysFeature) "
                     "WHERE f.id IN $fids AND t.id CONTAINS '::' "
                     "RETURN t.id AS tid, t.lastRun AS lr, t.scannedAt AS sa "
                     "ORDER BY t.lastRun DESC, t.scannedAt DESC",
                     fids=feature_ids
                 ).data()
+
+                if tier_rows and not tier_rows == test_rows:
+                    pass  # used tier-preferred file — no note needed
+                elif not tier_rows and test_rows:
+                    print(f"  ⚠  No {tier}-tier test file found for {subject_id}; "
+                          f"using best available. Use --file to override.", file=sys.stderr)
             else:
                 test_rows = []
 
             if test_rows:
                 # Extract unique file paths (before first ::), preserving order.
-                # Only keep IDs that look like file paths (contain / or end in .py/.go)
                 seen: dict[str, None] = {}
                 for tr in test_rows:
                     tid = tr["tid"]
@@ -5105,15 +5316,20 @@ Rules:
 - action must be a concrete implementation instruction when status is WARN or FAIL
 - Return raw JSON only, no markdown fences"""
 
-    resp = client.messages.create(
-        model=model_id,
-        max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = resp.content[0].text.strip()
+    try:
+        raw = _ai_call(prompt, model_name, max_tokens=2048)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr); sys.exit(1)
 
     import re as _re
     json_match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+    if not json_match:
+        # Retry with stricter instruction
+        try:
+            raw = _ai_call(prompt + "\n\nReturn ONLY the JSON object, no markdown fences.", model_name)
+            json_match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+        except Exception:
+            pass
     if not json_match:
         print("ERROR: Could not parse AI response as JSON", file=sys.stderr)
         print(raw, file=sys.stderr)
@@ -5824,14 +6040,18 @@ def main():
 
     sp = sub.add_parser("close-defect", help="Mark a defect as closed")
     sp.add_argument("--id", required=True)
+    sp.add_argument("--skip-uc-check", action="store_true", dest="skip_uc_check",
+                    help="Suppress UC prose review (use when defect was env/test issue, not a behaviour change)")
 
-    sp = sub.add_parser("update-enhancement", help="Update title, description, priority, source, or instance on an enhancement")
-    sp.add_argument("--id",          required=True)
-    sp.add_argument("--title",       default="")
-    sp.add_argument("--description", default="")
-    sp.add_argument("--priority",    default="", choices=["","Must","Should","Could"])
-    sp.add_argument("--source",      default="")
-    sp.add_argument("--instance",    default="", help="Reassign to a different instance")
+    sp = sub.add_parser("update-enhancement", help="Update title, description, priority, source, instance, or deploy-checklist on an enhancement")
+    sp.add_argument("--id",               required=True)
+    sp.add_argument("--title",            default="")
+    sp.add_argument("--description",      default="")
+    sp.add_argument("--priority",         default="", choices=["","Must","Should","Could"])
+    sp.add_argument("--source",           default="")
+    sp.add_argument("--instance",         default="", help="Reassign to a different instance")
+    sp.add_argument("--deploy-checklist", default="", dest="deploy_checklist",
+                    help="Markdown checklist of deployment steps, e.g. '- [ ] restart gateway\\n- [ ] rebuild image'")
 
     sp = sub.add_parser("update-feature", help="Update name, description, or status on a SysFeature")
     sp.add_argument("--id",          required=True, help="Feature ID, e.g. F-P7-001")
@@ -5909,6 +6129,9 @@ def main():
 
     sp = sub.add_parser("show-enhancement", help="Display full details of an enhancement")
     sp.add_argument("--id", required=True, help="Enhancement ID, e.g. ENH-024")
+
+    sp = sub.add_parser("show-usecase", help="Display full details of a SysUseCase")
+    sp.add_argument("--id", required=True, help="UC ID, e.g. UC-DLG-001")
 
     sp = sub.add_parser("show-defect", help="Display full details of a defect")
     sp.add_argument("--id", required=True, help="Defect ID, e.g. DEF-042")
@@ -6061,6 +6284,7 @@ def main():
                     choices=["proposed","adopted","deprecated","superseded"])
     sp.add_argument("--date",         default="")
     sp.add_argument("--decision",     default="")
+    sp.add_argument("--description",  default="", help="Alias for --decision (same field)")
     sp.add_argument("--context",      default="")
     sp.add_argument("--consequences", default="")
     sp.add_argument("--addresses",    default="", help="Comma-separated SysArchStd IDs")
@@ -6226,7 +6450,7 @@ def main():
     sp.add_argument("--entity",   default="", help="Entity ID, e.g. UC-DLG-001 or F-DLG-001")
     sp.add_argument("--instance", default="", help="Instance name — evaluates all entities in instance")
     sp.add_argument("--type",     default="", help="Filter entity type for --instance mode, e.g. SysUseCase")
-    sp.add_argument("--ai",       action="store_true", help="Enable AI evaluation of guidance+ai standards (requires ANTHROPIC_API_KEY)")
+    sp.add_argument("--ai",       action="store_true", help="Enable AI evaluation of guidance+ai standards (uses Claude Code session tokens or ANTHROPIC_API_KEY)")
     sp.add_argument("--model",    default="haiku", choices=["haiku","sonnet"], help="Model for --ai mode (default: haiku)")
 
 
@@ -6341,6 +6565,7 @@ def main():
         "reconcile-done":     cmd_reconcile_done,
         "start-enhancement":  cmd_start_enhancement,
         "show-enhancement":   cmd_show_enhancement,
+        "show-usecase":       cmd_show_usecase,
         "show-defect":        cmd_show_defect,
         "update-defect":      cmd_update_defect,
         "create-proposal":    cmd_create_proposal,
