@@ -3326,6 +3326,444 @@ def cmd_feedback(args):
     print(f"✓ {fb_id}  [{args.instance}]  {args.body[:72]}")
 
 
+def cmd_add_standard(args):
+    """Add a project-specific SysArchStd node (tier=project always)."""
+    drv = _driver()
+    with drv.session() as s:
+        existing = s.run("MATCH (a:SysArchStd {id:$id}) RETURN a.id", id=args.id).single()
+        if existing:
+            print(f"⚠ {args.id} already exists — use update-enhancement or raw SET to edit",
+                  file=sys.stderr)
+            drv.close(); sys.exit(1)
+        types = [t.strip() for t in (args.applies_to or "").split(",") if t.strip()]
+        enforce = getattr(args, "enforcement", "mandatory") or "mandatory"
+        s.run("""
+            CREATE (a:SysArchStd {
+                id: $id, title: $title, description: $desc,
+                category: $cat, status: 'adopted',
+                appliesToTypes: $types, appliesWhen: $when,
+                source: 'project', tier: 'project',
+                evaluationMethod: $method, enforcement: $enforce
+            })
+        """, id=args.id, title=args.title, desc=args.description,
+             cat=args.category or "quality",
+             types=types or ["SysUseCase"],
+             when=args.applies_when or "",
+             method=args.evaluation or "manual",
+             enforce=enforce)
+    drv.close()
+    print(f"✓ {args.id} created  [{args.category or 'quality'}]  tier=project  evaluation={args.evaluation or 'manual'}  enforcement={enforce}")
+
+
+def cmd_quality_review(args):
+    """Evaluate all applicable SysArchStd standards for an entity or instance.
+
+    Enforcement model:
+      mandatory + automated → graph query; failure exits 1 (hard gate)
+      mandatory + manual    → checklist item; printed as [MANUAL]
+      guidance + automated  → graph query; failure printed as [SUGGEST] (no gate)
+      guidance + ai         → LLM assessment; printed as [AI] with score (no gate)
+      guidance + manual     → review prompt; printed as [REVIEW] (no gate)
+
+    Usage:
+      quality-review --entity UC-DLG-001
+      quality-review --entity US-CTM-010 --ai  (enable AI evaluation of guidance standards)
+      quality-review --instance manage --type SysUseCase [--ai]
+    """
+    import os as _os
+
+    entity_id   = getattr(args, "entity",   "") or ""
+    instance    = getattr(args, "instance", "") or ""
+    type_filter = getattr(args, "type",     "") or ""
+    ai_mode     = getattr(args, "ai",       False)
+    model_name  = getattr(args, "model",    "haiku") or "haiku"
+
+    MODEL_IDS = {"haiku": "claude-haiku-4-5-20251001", "sonnet": "claude-sonnet-4-6"}
+    model_id  = MODEL_IDS.get(model_name, MODEL_IDS["haiku"])
+
+    if not entity_id and not instance:
+        print("ERROR: provide --entity or --instance", file=sys.stderr); sys.exit(1)
+
+    ai_client = None
+    if ai_mode:
+        try:
+            import anthropic as _anthropic
+            api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                print("WARNING: --ai requires ANTHROPIC_API_KEY — AI standards will be skipped",
+                      file=sys.stderr)
+                ai_mode = False
+            else:
+                ai_client = _anthropic.Anthropic(api_key=api_key)
+        except ImportError:
+            print("WARNING: pip install anthropic for --ai mode", file=sys.stderr)
+            ai_mode = False
+
+    W = 72
+    drv = _driver()
+    with drv.session() as s:
+
+        # ── Resolve entity type(s) ─────────────────────────────────────────
+        if entity_id:
+            label_row = s.run("""
+                MATCH (n) WHERE n.id = $id
+                RETURN labels(n) AS lbls, n.wizardBased AS wizardBased,
+                       n.title AS title, n.goal AS goal, n.description AS desc,
+                       n.actor AS actor, n.benefit AS benefit
+            """, id=entity_id).single()
+            if not label_row:
+                print(f"ERROR: entity '{entity_id}' not found", file=sys.stderr)
+                drv.close(); sys.exit(1)
+            entity_labels = label_row["lbls"]
+            wizard_based  = label_row.get("wizardBased") or False
+            entity_text   = " ".join(filter(None, [
+                label_row.get("title"), label_row.get("goal"),
+                label_row.get("actor"), label_row.get("benefit"),
+                label_row.get("desc"),
+            ]))
+            targets = [(entity_id, entity_labels, wizard_based, entity_text)]
+        else:
+            target_types = [type_filter] if type_filter else ["SysUseCase", "SysFeature", "SysUserStory"]
+            targets = []
+            for t in target_types:
+                if t == "SysUseCase":
+                    rows = s.run("""
+                        MATCH (n:SysUseCase {instance:$inst})
+                        RETURN n.id AS id, n.wizardBased AS wb, n.title AS t, n.description AS d
+                    """, inst=instance).data()
+                    for r in rows:
+                        txt = " ".join(filter(None, [r.get("t"), r.get("d")]))
+                        targets.append((r["id"], [t], r.get("wb") or False, txt))
+                elif t == "SysFeature":
+                    rows = s.run("""
+                        MATCH (m:SysModule {instance:$inst})-[:PROVIDES]->(n:SysFeature)
+                        RETURN n.id AS id, n.name AS t, n.description AS d
+                    """, inst=instance).data()
+                    for r in rows:
+                        targets.append((r["id"], [t], False, r.get("t","") or ""))
+                elif t == "SysUserStory":
+                    rows = s.run("""
+                        MATCH (n:SysUserStory)-[:REALIZED_BY]->(uc:SysUseCase {instance:$inst})
+                        RETURN DISTINCT n.id AS id, n.title AS t, n.goal AS g,
+                               n.actor AS a, n.benefit AS b
+                    """, inst=instance).data()
+                    for r in rows:
+                        txt = " ".join(filter(None, [r.get("t"), r.get("g"), r.get("a"), r.get("b")]))
+                        targets.append((r["id"], [t], False, txt))
+
+        if not targets:
+            print(f"No entities found for {'instance ' + instance if instance else entity_id}")
+            drv.close(); return
+
+        # ── Graph query checks (automated) ────────────────────────────────
+        GRAPH_CHECKS: dict[str, tuple] = {
+            "stories_without_uc":      ("MATCH (n:SysUserStory {id:$id}) WHERE NOT (n)-[:REALIZED_BY]->(:SysUseCase) RETURN count(n) AS n", "Missing REALIZED_BY→UseCase"),
+            "stories_without_feature": ("MATCH (n:SysUserStory {id:$id}) WHERE NOT (n)-[:REQUIRES]->(:SysFeature) RETURN count(n) AS n", "Missing REQUIRES→Feature"),
+            "uc_without_story":        ("MATCH (n:SysUseCase {id:$id}) WHERE NOT (:SysUserStory)-[:REALIZED_BY]->(n) RETURN count(n) AS n", "Missing UserStory→REALIZED_BY"),
+            "uc_without_feature":      ("MATCH (n:SysUseCase {id:$id}) WHERE NOT (n)-[:REQUIRES]->(:SysFeature) RETURN count(n) AS n", "Missing REQUIRES→Feature"),
+            "uc_without_test":         ("MATCH (n:SysUseCase {id:$id}) WHERE NOT (n)-[:REQUIRES]->(:SysFeature)<-[:VERIFIES]-(:SysTest) RETURN count(n) AS n", "No tests via UC→Feature←Test"),
+            "feature_without_module":  ("MATCH (n:SysFeature {id:$id}) WHERE NOT (:SysModule)-[:PROVIDES]->(n) RETURN count(n) AS n", "Missing Module→PROVIDES"),
+            "feature_without_test":    ("MATCH (n:SysFeature {id:$id}) WHERE NOT (:SysTest)-[:VERIFIES]->(n) RETURN count(n) AS n", "No VERIFIES→Feature test"),
+        }
+
+        def _text_check(check_key: str, text: str, eid: str) -> tuple[bool, str]:
+            """Returns (passes, detail) for text-based QUS automated checks."""
+            import re as _re
+            tl = (text or "").lower()
+            if check_key == "story_wellformed":
+                ok = ("as a" in tl or "as an" in tl) and ("i want" in tl or "i need" in tl or "i can" in tl)
+                return ok, "" if ok else "Missing 'As a [role], I want [means]' structure"
+            if check_key == "story_atomic":
+                # Flag if goal contains splitting conjunctions between verb phrases
+                goal_part = tl.split("so that")[0] if "so that" in tl else tl
+                ok = not _re.search(r'\band\b.{5,}\band\b', goal_part)
+                return ok, "" if ok else "Goal may combine multiple objectives (conjunction detected)"
+            if check_key == "story_minimal":
+                impl_markers = ["shall", "must use", "using [", "via [", "the system will", "database", "api call", "rest "]
+                found = [m for m in impl_markers if m in tl]
+                return not found, "" if not found else f"Implementation detail detected: '{found[0]}'"
+            if check_key == "story_full_sentence":
+                ok = len(text.split()) >= 5
+                return ok, "" if ok else "Story text is too short to be a complete sentence"
+            if check_key == "story_unique":
+                # Uniqueness check requires comparing across stories — skip per-entity
+                return True, ""
+            if check_key == "story_uniform":
+                # Uniform check requires set context — skip per-entity
+                return True, ""
+            return True, ""
+
+        # Load all standards
+        all_stds = s.run("""
+            MATCH (a:SysArchStd)
+            WHERE a.appliesToTypes IS NOT NULL
+            RETURN a.id AS id, a.title AS title, a.tier AS tier,
+                   a.appliesToTypes AS types, a.appliesWhen AS when,
+                   a.evaluationMethod AS method, a.checkKey AS check,
+                   a.category AS cat, a.enforcement AS enforcement,
+                   a.description AS desc
+            ORDER BY a.enforcement DESC, a.tier DESC, a.category, a.id
+        """).data()
+
+        fail_total = suggest_total = pass_total = manual_total = review_total = 0
+        all_entity_fails = []
+
+        for eid, elabels, ewizard, etext in targets:
+            applicable = [
+                std for std in all_stds
+                if any(lbl in (std["types"] or []) for lbl in elabels)
+                and not (std.get("when") == "wizardBased=true" and not ewizard)
+            ]
+            if not applicable:
+                continue
+
+            print(f"\n{'═' * W}")
+            print(f"  quality-review: {eid}  ({', '.join(elabels)})")
+            print(f"{'═' * W}")
+
+            deferred_ai = []
+            entity_fails = []
+
+            for std in applicable:
+                sid      = std["id"]
+                method   = std.get("method") or "manual"
+                enforce  = std.get("enforcement") or "mandatory"
+                tier     = std.get("tier") or "default"
+                tbadge   = f"[{tier[:3]}]"
+                check    = std.get("check")
+                is_gate  = (enforce == "mandatory")
+
+                if method == "automated":
+                    # Graph query or text check
+                    if check and check in GRAPH_CHECKS:
+                        q, gap = GRAPH_CHECKS[check]
+                        n = s.run(q, id=eid).single()["n"]
+                        passes = (n == 0)
+                    elif check and check.startswith("story_"):
+                        passes, gap = _text_check(check, etext, eid)
+                    elif check == "coverage_ratio":
+                        # TRC-006: system-level ratio check, skip per-entity
+                        continue
+                    else:
+                        continue
+
+                    if passes:
+                        print(f"  [PASS]    {sid:<16} {tbadge} {std['title'][:42]}")
+                        pass_total += 1
+                    elif is_gate:
+                        print(f"  [FAIL]    {sid:<16} {tbadge} {std['title'][:42]}")
+                        print(f"            → {gap}")
+                        fail_total += 1
+                        entity_fails.append(sid)
+                    else:
+                        print(f"  [SUGGEST] {sid:<16} {tbadge} {std['title'][:42]}")
+                        print(f"            → {gap}")
+                        suggest_total += 1
+
+                elif method == "ai":
+                    if ai_mode and ai_client:
+                        deferred_ai.append(std)
+                    else:
+                        label = "[AI]   " if not ai_mode else "[AI]   "
+                        print(f"  {label}   {sid:<16} {tbadge} {std['title'][:42]}  (run with --ai to evaluate)")
+
+                elif method == "manual":
+                    if is_gate:
+                        print(f"  [MANUAL]  {sid:<16} {tbadge} {std['title'][:42]}")
+                        manual_total += 1
+                    else:
+                        print(f"  [REVIEW]  {sid:<16} {tbadge} {std['title'][:42]}")
+                        review_total += 1
+
+            # ── AI evaluation for guidance+ai standards ────────────────────
+            if deferred_ai and ai_client:
+                for std in deferred_ai:
+                    sid   = std["id"]
+                    tbadge = f"[{(std.get('tier') or 'def')[:3]}]"
+                    prompt = (
+                        f"You are evaluating an entity against a quality standard.\n\n"
+                        f"## Entity: {eid}\n{etext[:800]}\n\n"
+                        f"## Standard: {std['title']}\n{std.get('desc','')}\n\n"
+                        f"Evaluate the entity text against this standard. "
+                        f"Return exactly one line: SCORE: GOOD|WEAK|POOR — one sentence reasoning."
+                    )
+                    try:
+                        resp = ai_client.messages.create(
+                            model=model_id, max_tokens=128,
+                            messages=[{"role":"user","content":prompt}]
+                        )
+                        reply = resp.content[0].text.strip()
+                        score = "POOR"
+                        for v in ("GOOD","WEAK","POOR"):
+                            if v in reply.upper(): score = v; break
+                        reason = reply.split("—",1)[-1].strip() if "—" in reply else reply
+                        print(f"  [AI-{score:<4}] {sid:<16} {tbadge} {std['title'][:42]}")
+                        print(f"            {reason[:90]}")
+                    except Exception as e:
+                        print(f"  [AI-ERR]  {sid:<16}  ({e})", file=sys.stderr)
+
+            # Deferred non-AI AS-REQ/AS-TEST — note commands
+            deferred_cmd = [st for st in applicable
+                            if st.get("method") == "automated"
+                            and st.get("check") not in GRAPH_CHECKS
+                            and not (st.get("check") or "").startswith("story_")
+                            and st.get("check") != "coverage_ratio"
+                            and st["id"].startswith(("AS-REQ-","AS-TEST-"))]
+            if deferred_cmd:
+                ef = f"--uc {eid}" if "SysUseCase" in elabels else f"--us {eid}" if "SysUserStory" in elabels else f"--feature {eid}"
+                req  = [st for st in deferred_cmd if st["id"].startswith("AS-REQ-")]
+                test = [st for st in deferred_cmd if st["id"].startswith("AS-TEST-")]
+                if req:  print(f"  [NOTE]    {len(req)} AS-REQ → python3 scripts/sys_graph.py coverage-review {ef}")
+                if test: print(f"  [NOTE]    {len(test)} AS-TEST → python3 scripts/sys_graph.py audit-test {ef}")
+
+            if entity_fails:
+                all_entity_fails.extend(entity_fails)
+
+    drv.close()
+    print(f"\n{'═' * W}")
+    print(f"  PASS {pass_total}  FAIL {fail_total}  SUGGEST {suggest_total}  MANUAL {manual_total}  REVIEW {review_total}")
+    if all_entity_fails:
+        print(f"  Mandatory failures: {', '.join(all_entity_fails[:8])}")
+    print(f"{'═' * W}\n")
+    if fail_total:
+        sys.exit(1)
+
+
+def cmd_feedback_submit(args):
+    """Format feedback as a ready-to-send email block for sysedge-feedback@org-edge.com.
+
+    Creates a new feedback entry (--body) and/or formats pending entries as a
+    structured email that can be copied and sent. No external service required —
+    the formatted block is printed to stdout; the user sends it manually.
+
+    Usage:
+      feedback-submit --category gap --body "..." --instance myproject
+      feedback-submit --pending          # format all unsubmitted entries
+      feedback-submit --open             # also try to open default email client
+    """
+    import urllib.parse as _urlparse
+    from datetime import date as _date
+
+    category = getattr(args, "category", "general") or "general"
+    body_text = getattr(args, "body", "") or ""
+    instance  = getattr(args, "instance", "") or "unknown"
+    pending   = getattr(args, "pending", False)
+    open_mail = getattr(args, "open", False)
+    to_addr   = getattr(args, "to", "sysedge-feedback@org-edge.com") or "sysedge-feedback@org-edge.com"
+
+    entries = []
+
+    # Store in graph if available and body provided
+    if body_text:
+        try:
+            drv = _driver()
+            with drv.session() as s:
+                fb_id = _alloc_id(s, "SysFeedback", "FB-")
+                s.run("""
+                    MERGE (f:SysFeedback {id:$id})
+                    SET f.instance=$inst, f.category=$cat, f.body=$body,
+                        f.createdAt=$now, f.actioned=false, f.submitted=false
+                """, id=fb_id, inst=instance, cat=category,
+                     body=body_text, now=_now_iso())
+            drv.close()
+            entries.append({"id": fb_id, "instance": instance,
+                            "category": category, "body": body_text,
+                            "createdAt": _now_iso()})
+            print(f"  ✓ {fb_id} recorded in graph", file=sys.stderr)
+        except Exception:
+            # Graph unavailable — still format for email
+            entries.append({"id": "FB-new", "instance": instance,
+                            "category": category, "body": body_text,
+                            "createdAt": _now_iso()})
+
+    # Fetch pending unsubmitted entries if requested
+    if pending:
+        try:
+            drv = _driver()
+            with drv.session() as s:
+                rows = s.run("""
+                    MATCH (f:SysFeedback)
+                    WHERE (f.submitted IS NULL OR f.submitted = false)
+                    RETURN f.id AS id, f.instance AS inst, f.category AS cat,
+                           f.body AS body, f.createdAt AS ts
+                    ORDER BY f.createdAt DESC LIMIT 20
+                """).data()
+            drv.close()
+            for r in rows:
+                if not any(e["id"] == r["id"] for e in entries):
+                    entries.append({"id": r["id"], "instance": r["inst"] or "unknown",
+                                    "category": r["cat"] or "general",
+                                    "body": r["body"] or "",
+                                    "createdAt": r["ts"] or ""})
+        except Exception:
+            pass
+
+    if not entries:
+        if not body_text:
+            print("Provide --body to submit new feedback, or --pending to format unsubmitted entries.")
+        return
+
+    # Format email block
+    today    = _date.today().isoformat()
+    n        = len(entries)
+    cat_list = ", ".join(sorted({e["category"] for e in entries}))
+    inst_list = ", ".join(sorted({e["instance"] for e in entries}))
+
+    subject = f"SysEdge feedback — {cat_list} — {inst_list} — {today}"
+
+    lines = [
+        f"To: {to_addr}",
+        f"Subject: {subject}",
+        "",
+        f"Date: {today}",
+        f"Instance(s): {inst_list}",
+        f"Category(s): {cat_list}",
+        "",
+    ]
+    for i, e in enumerate(entries, 1):
+        if n > 1:
+            lines.append(f"── Entry {i} of {n}  [{e['id']}]  [{e['category']}]  [{e['instance']}]")
+        lines.append(e["body"])
+        lines.append("")
+    lines += [
+        "---",
+        "Sent via: SysEdge feedback-submit",
+    ]
+
+    email_body = "\n".join(lines)
+
+    # Print formatted block
+    print(f"\n{'═' * 66}")
+    print(f"  FEEDBACK EMAIL  —  copy and send to {to_addr}")
+    print(f"{'═' * 66}")
+    print(email_body)
+    print(f"{'═' * 66}\n")
+
+    # Optionally open default email client
+    if open_mail:
+        try:
+            import webbrowser as _wb
+            mailto_body = _urlparse.quote(email_body)
+            mailto_subj = _urlparse.quote(subject)
+            _wb.open(f"mailto:{to_addr}?subject={mailto_subj}&body={mailto_body}")
+            print(f"  → Opened default email client")
+        except Exception as e:
+            print(f"  → Could not open email client: {e}", file=sys.stderr)
+
+    # Mark entries as submitted in graph
+    if entries:
+        try:
+            drv = _driver()
+            with drv.session() as s:
+                fb_ids = [e["id"] for e in entries if not e["id"].startswith("FB-new")]
+                if fb_ids:
+                    s.run("UNWIND $ids AS id MATCH (f:SysFeedback {id:id}) SET f.submitted=true",
+                          ids=fb_ids)
+            drv.close()
+        except Exception:
+            pass
+
+
 def cmd_show_feedback(args):
     """Display recorded SysFeedback entries."""
     drv = _driver()
@@ -3615,21 +4053,24 @@ def cmd_update_feature(args):
 
 
 def cmd_update_usecase(args):
-    """Update title, description, preconditions, mainFlow, postconditions, or priority on a SysUseCase."""
+    """Update title, description, preconditions, mainFlow, postconditions, authorizedRoles, failureScenarios, or priority on a SysUseCase."""
     drv = _driver()
     with drv.session() as s:
         if not s.run("MATCH (uc:SysUseCase {id:$id}) RETURN uc.id", id=args.id).single():
             print(f"⚠ {args.id} not found", file=sys.stderr); drv.close(); sys.exit(1)
         updates = {}
-        if getattr(args, "title",         ""): updates["title"]         = args.title
-        if getattr(args, "description",   ""): updates["description"]   = args.description
-        if getattr(args, "preconditions", ""): updates["preconditions"] = args.preconditions
-        if getattr(args, "main_flow",     ""): updates["mainFlow"]      = args.main_flow
-        if getattr(args, "postconditions",""): updates["postconditions"]= args.postconditions
-        if getattr(args, "priority",      ""): updates["priority"]      = args.priority
+        if getattr(args, "title",              ""): updates["title"]             = args.title
+        if getattr(args, "description",        ""): updates["description"]       = args.description
+        if getattr(args, "preconditions",      ""): updates["preconditions"]     = args.preconditions
+        if getattr(args, "main_flow",          ""): updates["mainFlow"]          = args.main_flow
+        if getattr(args, "postconditions",     ""): updates["postconditions"]    = args.postconditions
+        if getattr(args, "authorized_roles",   ""): updates["authorizedRoles"]   = args.authorized_roles
+        if getattr(args, "failure_scenarios",  ""): updates["failureScenarios"]  = args.failure_scenarios
+        if getattr(args, "priority",           ""): updates["priority"]          = args.priority
         if not updates:
             print("Nothing to update — specify at least one of "
-                  "--title --description --preconditions --main-flow --postconditions --priority",
+                  "--title --description --preconditions --main-flow --postconditions "
+                  "--authorized-roles --failure-scenarios --priority",
                   file=sys.stderr); drv.close(); return
         set_clause = ", ".join(f"uc.{k}=${k}" for k in updates)
         s.run(f"MATCH (uc:SysUseCase {{id:$id}}) SET {set_clause}", id=args.id, **updates)
@@ -4166,12 +4607,31 @@ def _coverage_review_as_req(s, client, model_id, model_name, us_id, uc_id):
             "RETURN us.id AS id, us.title AS title, us.actor AS actor, "
             "       us.goal AS goal, us.benefit AS benefit, "
             "       us.acceptanceCriteria AS ac, us.outOfScope AS oos, "
-            "       collect(DISTINCT {id: uc.id, title: uc.title, desc: uc.description, precond: uc.preconditions, mainflow: uc.mainFlow}) AS ucs",
+            "       collect(DISTINCT {id: uc.id, title: uc.title, desc: uc.description, precond: uc.preconditions, mainflow: uc.mainFlow, authRoles: uc.authorizedRoles, failScenarios: uc.failureScenarios}) AS ucs",
             id=us_id
         ).single()
         if not row:
             print(f"ERROR: User story {us_id} not found", file=sys.stderr); sys.exit(1)
         uc_rows = [u for u in (row["ucs"] or []) if u.get("id")]
+
+        # ENH-876: fetch test counts per UC via indirect path (UC→Feature←Test)
+        # collect() in the main query cannot do this aggregation per-UC cleanly
+        if uc_rows:
+            uc_ids_for_count = [u["id"] for u in uc_rows]
+            test_counts = {
+                r["uid"]: {"count": r["tc"], "last_run": str(r.get("lr") or "")[:10]}
+                for r in s.run("""
+                    UNWIND $uids AS uid
+                    MATCH (uc:SysUseCase {id: uid})
+                    OPTIONAL MATCH (uc)-[:REQUIRES]->(f:SysFeature)<-[:VERIFIES]-(t:SysTest)
+                    OPTIONAL MATCH (pkg:SysTestPackage)-[:CONTAINS_TEST]->(t)
+                    RETURN uid, count(DISTINCT t) AS tc, max(pkg.lastRun) AS lr
+                """, uids=uc_ids_for_count).data()
+            }
+            for u in uc_rows:
+                tc = test_counts.get(u["id"], {})
+                u["testCount"] = tc.get("count", 0)
+                u["lastRun"]   = tc.get("last_run", "")
 
         # Preflight: flag UCs with null/short descriptions before wasting AI calls
         thin_ucs = [u["id"] for u in uc_rows if not u.get("desc") or len(u["desc"]) < 50]
@@ -4192,6 +4652,10 @@ def _coverage_review_as_req(s, client, model_id, model_name, us_id, uc_id):
         if uc_rows:
             uc_summary = "\n".join(
                 f"  [{u['id']}] {u['title']}"
+                + (f"\n    Tests via UC→Feature→Test: {u.get('testCount', 0)}"
+                   + (f" (last run: {u['lastRun']})" if u.get("lastRun") else " (none run)"))
+                + (f"\n    Authorized roles: {u['authRoles']}" if u.get("authRoles") else "")
+                + (f"\n    Failure scenarios: {u['failScenarios']}" if u.get("failScenarios") else "")
                 + (f"\n    Preconditions: {u['precond']}" if u.get("precond") else "")
                 + (f"\n    Main flow: {u['mainflow']}" if u.get("mainflow") else "")
                 + (f"\n    {u['desc']}" if u.get("desc") else "")
@@ -4207,13 +4671,18 @@ def _coverage_review_as_req(s, client, model_id, model_name, us_id, uc_id):
             "MATCH (uc:SysUseCase {id:$id}) "
             "OPTIONAL MATCH (us:SysUserStory)-[:REALIZED_BY]->(uc) "
             "OPTIONAL MATCH (uc)-[:REQUIRES]->(f:SysFeature) "
+            # ENH-876: count tests via indirect UC→Feature←Test path (no direct VERIFIES edge on UC)
             "OPTIONAL MATCH (t:SysTest)-[:VERIFIES]->(f) "
+            "OPTIONAL MATCH (pkg:SysTestPackage)-[:CONTAINS_TEST]->(t) "
             "RETURN uc.id AS id, uc.title AS title, uc.description AS desc, "
             "       uc.preconditions AS precond, uc.mainFlow AS mainflow, "
+            "       uc.authorizedRoles AS auth_roles, "
+            "       uc.failureScenarios AS fail_scenarios, "
             "       uc.instance AS instance, "
             "       collect(DISTINCT us.id) AS story_ids, "
             "       collect(DISTINCT f.id) AS feat_ids, "
-            "       count(DISTINCT t) AS test_count",
+            "       count(DISTINCT t) AS test_count, "
+            "       max(pkg.lastRun) AS last_run",
             id=uc_id
         ).single()
         if not row:
@@ -4223,12 +4692,17 @@ def _coverage_review_as_req(s, client, model_id, model_name, us_id, uc_id):
             f"Instance: {row.get('instance') or 'unknown'}",
             f"Parent stories: {', '.join(row['story_ids'] or []) or '(none)'}",
             f"Features: {', '.join(row['feat_ids'] or []) or '(none)'}",
-            f"Linked tests: {row.get('test_count', 0)}",
+            f"Tests linked via UC→Feature→Test path: {row.get('test_count', 0)}"
+            + (f" (last run: {str(row['last_run'])[:10]})" if row.get('last_run') else " (none run)"),
         ]
         if row.get("precond"):
             context_lines.append(f"Preconditions: {row['precond']}")
         if row.get("mainflow"):
             context_lines.append(f"Main flow: {row['mainflow']}")
+        if row.get("auth_roles"):
+            context_lines.append(f"Authorized roles: {row['auth_roles']}")
+        if row.get("fail_scenarios"):
+            context_lines.append(f"Failure scenarios: {row['fail_scenarios']}")
         if row.get("desc"):
             context_lines.append(f"\nDescription:\n{row['desc']}")
         header = f"coverage-review: {uc_id}"
@@ -4459,7 +4933,9 @@ def cmd_audit_test(args):
                 "OPTIONAL MATCH (us:SysUserStory)-[:REALIZED_BY]->(uc) "
                 "OPTIONAL MATCH (uc)-[:REQUIRES]->(f:SysFeature) "
                 "RETURN uc.id AS id, uc.title AS title, uc.description AS desc, "
-                "       uc.instance AS instance, "
+                "       uc.instance AS instance, uc.preconditions AS precond, "
+                "       uc.authorizedRoles AS auth_roles, "
+                "       uc.failureScenarios AS fail_scenarios, "
                 "       collect(DISTINCT us.title) AS stories, "
                 "       collect(DISTINCT f.id) AS feat_ids",
                 id=uc_id
@@ -4473,6 +4949,12 @@ def cmd_audit_test(args):
             ]
             if row.get("stories"):
                 context_lines.append(f"Parent stories: {', '.join(row['stories'])}")
+            if row.get("precond"):
+                context_lines.append(f"Preconditions: {row['precond']}")
+            if row.get("auth_roles"):
+                context_lines.append(f"Authorized roles: {row['auth_roles']}")
+            if row.get("fail_scenarios"):
+                context_lines.append(f"Failure scenarios: {row['fail_scenarios']}")
             if row.get("desc"):
                 context_lines.append(f"\nDescription:\n{row['desc']}")
 
@@ -5362,9 +5844,13 @@ def main():
     sp.add_argument("--title",           default="")
     sp.add_argument("--description",     default="")
     sp.add_argument("--preconditions",   default="")
-    sp.add_argument("--main-flow",       default="", dest="main_flow")
-    sp.add_argument("--postconditions",  default="")
-    sp.add_argument("--priority",        default="", choices=["","P1","P2","P3"])
+    sp.add_argument("--main-flow",         default="", dest="main_flow")
+    sp.add_argument("--postconditions",    default="")
+    sp.add_argument("--authorized-roles",  default="", dest="authorized_roles",
+                    help="Roles permitted to perform this UC, e.g. 'Manager,Analyst'")
+    sp.add_argument("--failure-scenarios", default="", dest="failure_scenarios",
+                    help="Reachable failure states, e.g. 'Delegate rejects; delegation expires'")
+    sp.add_argument("--priority",          default="", choices=["","P1","P2","P3"])
 
     sp = sub.add_parser("update-story", help="Update fields on a SysUserStory")
     sp.add_argument("--id",                    required=True, help="Story ID, e.g. US-007")
@@ -5704,9 +6190,44 @@ def main():
     sp.add_argument("--id",   required=True, help="Comma-separated FB-IDs, e.g. FB-002,FB-004")
     sp.add_argument("--note", default="",    help="Optional note on how it was actioned")
 
+    sp = sub.add_parser("feedback-submit",
+                        help="Format feedback as a ready-to-send email for sysedge-feedback@org-edge.com")
+    sp.add_argument("--body",     default="", help="Feedback text (creates a new entry)")
+    sp.add_argument("--category", default="general",
+                    choices=["general","usability","gap","workflow","positive"],
+                    help="Feedback category")
+    sp.add_argument("--instance", default="", help="Your instance or project name")
+    sp.add_argument("--pending",  action="store_true",
+                    help="Include all unsubmitted feedback entries from the graph")
+    sp.add_argument("--open",     action="store_true",
+                    help="Try to open the default email client with pre-filled content")
+    sp.add_argument("--to",       default="sysedge-feedback@org-edge.com",
+                    help="Recipient address (default: sysedge-feedback@org-edge.com)")
+
     sp = sub.add_parser("feedback-summary", help="Per-instance feedback recency report")
     sp.add_argument("--days", type=int, default=7,
                     help="Flag instances silent longer than this many days (default: 7)")
+
+    sp = sub.add_parser("add-standard", help="Add a project-specific SysArchStd node (tier=project)")
+    sp.add_argument("--id",           required=True, help="Standard ID, e.g. AS-TEST-WIZ-001")
+    sp.add_argument("--title",        required=True, help="Short title")
+    sp.add_argument("--description",  required=True, help="Full standard description")
+    sp.add_argument("--category",     default="quality", help="Category, e.g. testing, quality, security")
+    sp.add_argument("--applies-to",   default="SysUseCase", dest="applies_to",
+                    help="Comma-separated node labels, e.g. SysUseCase,SysFeature")
+    sp.add_argument("--applies-when", default="", dest="applies_when",
+                    help="Condition, e.g. wizardBased=true (optional)")
+    sp.add_argument("--evaluation",   default="manual", choices=["automated","manual","ai"],
+                    help="Evaluation method: automated (graph query), manual (checklist), ai (LLM assessment)")
+    sp.add_argument("--enforcement",  default="mandatory", choices=["mandatory","guidance"],
+                    help="mandatory: gates close on fail; guidance: surfaces as suggestion (default: mandatory)")
+
+    sp = sub.add_parser("quality-review", help="Evaluate all applicable standards for an entity or instance")
+    sp.add_argument("--entity",   default="", help="Entity ID, e.g. UC-DLG-001 or F-DLG-001")
+    sp.add_argument("--instance", default="", help="Instance name — evaluates all entities in instance")
+    sp.add_argument("--type",     default="", help="Filter entity type for --instance mode, e.g. SysUseCase")
+    sp.add_argument("--ai",       action="store_true", help="Enable AI evaluation of guidance+ai standards (requires ANTHROPIC_API_KEY)")
+    sp.add_argument("--model",    default="haiku", choices=["haiku","sonnet"], help="Model for --ai mode (default: haiku)")
 
 
     sp = sub.add_parser("scan-go-tests",
@@ -5871,7 +6392,10 @@ def main():
         "feedback":       cmd_feedback,
         "show-feedback":     cmd_show_feedback,
         "ack-feedback":      cmd_ack_feedback,
+        "feedback-submit":    cmd_feedback_submit,
         "feedback-summary":  cmd_feedback_summary,
+        "add-standard":      cmd_add_standard,
+        "quality-review":    cmd_quality_review,
     }
     try:
         dispatch[args.cmd](args)

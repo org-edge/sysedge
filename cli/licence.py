@@ -167,16 +167,3 @@ def activate(lemon_squeezy_key: str, activation_url: str = "https://sysedge-acti
     return True
 
 
-# ── Development helper: generate a signed token (uses private key) ─────────────
-
-def _sign_token(payload: dict, private_key_hex: str) -> str:
-    """Sign a payload dict and return a licence token. Used by the activation server."""
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    priv_bytes = bytes.fromhex(private_key_hex)
-    private_key = Ed25519PrivateKey.from_private_bytes(priv_bytes)
-    payload_bytes = json.dumps(payload, separators=(",", ":")).encode()
-    sig_bytes = private_key.sign(payload_bytes)
-    payload_b64 = base64.urlsafe_b64encode(payload_bytes).rstrip(b"=").decode()
-    sig_b64 = base64.urlsafe_b64encode(sig_bytes).rstrip(b"=").decode()
-    return f"{payload_b64}.{sig_b64}"
