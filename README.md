@@ -92,7 +92,34 @@ Install Gemini CLI: `npm install -g @google/generative-ai-cli` then `gemini auth
 cp /path/to/sysedge/AGENTS.md .
 qwen     # or: codex
 ```
-Install Qwen Code: `npm install -g @qwen/qwen-code` then set `DASHSCOPE_API_KEY` (Alibaba Cloud free tier), or point to a local Ollama model.
+Install Qwen Code: `npm install -g @qwen-code/qwen-code`
+
+**Option A — Local Ollama model (free, no API key):**
+```bash
+ollama pull qwen2.5-coder:7b
+```
+Create `~/.qwen/settings.json`:
+```json
+{
+  "modelProviders": {
+    "openai": [{
+      "id": "qwen2.5-coder:7b",
+      "name": "Qwen2.5-Coder 7B (local)",
+      "envKey": "OLLAMA_API_KEY",
+      "baseUrl": "http://localhost:11434/v1",
+      "generationConfig": { "contextWindowSize": 32768 }
+    }]
+  }
+}
+```
+```bash
+export OLLAMA_API_KEY=ollama
+```
+
+**Option B — Alibaba Cloud DashScope (free tier):**
+```bash
+export DASHSCOPE_API_KEY=sk-...   # console.aliyun.com
+```
 
 ---
 
