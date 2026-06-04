@@ -1,15 +1,34 @@
 # SysEdge
 
-**Requirements traceability for Claude Code multi-agent teams.**
+**Requirements traceability for AI coding agent teams.**
 
-When ten Claude Code sessions work on the same codebase simultaneously, they burn tokens re-reading source files, duplicate each other's work, and leave coverage gaps no one notices. SysEdge gives every session a shared, live graph of what exists, what's tested, and what's pending — updated by the sessions themselves as they work.
+When multiple AI coding sessions work on the same codebase simultaneously, they burn tokens re-reading source files, duplicate each other's work, and leave coverage gaps no one notices. SysEdge gives every session a shared, live graph of what exists, what's tested, and what's pending — updated by the sessions themselves as they work.
+
+Verified on two production open-source codebases, cloned cold:
+- **Formbricks** (survey platform): 71% fewer orientation tokens — and SysEdge surfaced the PII spec gap that caused the export defect, before the code shipped
+- **Documenso** (e-signature platform): 5 findings in 15 minutes — including Inngest job handlers with no tests and expiration exception paths never specified
+
+---
+
+## Supported AI coding assistants
+
+SysEdge works with any of these — no API key required when running inside the tool:
+
+| Tool | Session instructions | AI calls |
+|---|---|---|
+| **Claude Code** | `/plugin install sysedge@sysedge` | `claude` CLI (session tokens) |
+| **Gemini CLI** | `GEMINI.md` auto-loaded | `gemini` CLI (session tokens, free) |
+| **Qwen Code** | `AGENTS.md` auto-loaded | `qwen` CLI (session tokens) |
+| **OpenAI Codex** | `AGENTS.md` auto-loaded | `codex exec` (session tokens) |
+
+For environments without a coding assistant CLI, set any of: `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `DASHSCOPE_API_KEY` in your `.env` file.
 
 ---
 
 ## What it looks like
 
 ```
-$ python3 sys_graph.py briefing --instance api
+$ python3 cli/sys_graph.py briefing --instance api
 
   MOD-auth           Auth & Session       12/12 ✓
                        ✓cmp 12/12  ✓int 12/12  ~uc  8/12  ✗e2e 0/12
@@ -20,7 +39,7 @@ $ python3 sys_graph.py briefing --instance api
     ENH-14  [Must]   Add rate limiting to /auth/login  → F-AUTH-003
     ENH-15  [Should] Pagination on /orders endpoint    → F-ORD-002
 
-$ python3 sys_graph.py start-enhancement --id ENH-14 --instance api
+$ python3 cli/sys_graph.py start-enhancement --id ENH-14 --instance api
 ✓ ENH-14 in-progress — other sessions can see this is being built
 ```
 
@@ -53,28 +72,33 @@ cp examples/seed-example.json data/sys-init.json
 python3 cli/sys_graph.py seed data/sys-init.json
 ```
 
-**5. Install the Claude Code plugin**
+**5. Connect your AI coding assistant**
 
-Via the plugin marketplace (recommended — requires Claude Code v2.1.128+):
+**Claude Code** (plugin marketplace):
 ```
 /plugin marketplace add org-edge/sysedge
 /plugin install sysedge@sysedge
 ```
 
-Then invoke with `/sysedge:sysedge` at the start of any session.
-
-Or install manually:
+**Gemini CLI** — copy `GEMINI.md` to your project root. Gemini auto-loads it:
 ```bash
-mkdir -p .claude/skills/sysedge
-curl -o .claude/skills/sysedge/SKILL.md \
-  https://raw.githubusercontent.com/org-edge/sysedge/main/plugins/sysedge/skills/sysedge/SKILL.md
+cp /path/to/sysedge/GEMINI.md .
+gemini   # GEMINI.md loaded automatically
 ```
+Install Gemini CLI: `npm install -g @google/generative-ai-cli` then `gemini auth login` (free, Google account).
+
+**Qwen Code / OpenAI Codex** — copy `AGENTS.md` to your project root. Both auto-load it:
+```bash
+cp /path/to/sysedge/AGENTS.md .
+qwen     # or: codex
+```
+Install Qwen Code: `npm install -g @qwen/qwen-code` then set `DASHSCOPE_API_KEY` (Alibaba Cloud free tier), or point to a local Ollama model.
 
 ---
 
 ## Bootstrap your project config
 
-The **Bootstrap Kit** includes `/init-sysedge` — a Claude Code skill that scans your working directory, detects Go/TypeScript/Python/Java/C# structure, and generates a complete seed JSON automatically. No manual JSON writing required.
+The **Bootstrap Kit** includes `/init-sysedge` — a skill that scans your working directory, detects Go/TypeScript/Python/Java/C# structure, and generates a complete seed JSON automatically. No manual JSON writing required.
 
 [Get the Bootstrap Kit →](https://www.org-edge.com/sysedge.html)
 
@@ -86,19 +110,16 @@ The **Bootstrap Kit** includes `/init-sysedge` — a Claude Code skill that scan
 |---|---|
 | `briefing --instance X` | Coverage by module, open enhancements, defects (30 seconds) |
 | `worklog --instance X` | Prioritised work queue for this session |
-| `test-gaps --instance X` | Missing test tiers per feature (e2e suppressed for non-master) |
+| `test-gaps --instance X` | Missing test tiers per feature |
+| `quality-review --entity UC-X` | Automated QUS + TRC standards check (free, no AI key) |
+| `quality-review --entity UC-X --ai` | + Cockburn UC guidance via AI (uses session tokens) |
 | `start-enhancement --id ENH-X --instance X` | Mark in-progress — visible to all sessions |
-| `close-enhancement --id ENH-X --instance X` | Mark done — smart checklist, `--graph-only` / `--test-only` to suppress code items |
-| `show-enhancement --id ENH-X` | Full description + linked features |
-| `create-enhancement --title "..." --instance X --priority Must` | File new work item |
+| `close-enhancement --id ENH-X --instance X` | Mark done — smart checklist |
 | `link-defect --feature F-X --title "..." --severity high --instance X` | File a defect before fixing it |
-| `update-defect --id DEF-X --description "..."` | Add root cause / investigation notes to a defect |
-| `link-usecase --id UC-X --feature F-X --story US-X --tests test.py::Class::fn` | Wire UC edges (features, stories, tests) |
-| `unlink-usecase --id UC-X --feature F-X` | Remove stale UC→Feature REQUIRES edge |
 | `link-endpoint --feature F-X --method GET --path /api/...` | Link endpoint to feature |
-| `audit-status --instance X` | Last audit-test + coverage-review timestamps per UC/US — flags stale |
+| `audit-status --instance X` | Last audit-test + coverage-review timestamps — flags stale |
+| `feedback-submit --category gap --body "..." --instance X` | Send feedback to sysedge-feedback@org-edge.com |
 | `backup` | Export full graph to JSON |
-| `seed backup.json --instance X` | Restore only your instance's nodes (safe) |
 
 ---
 
@@ -117,13 +138,11 @@ ui          — Frontend components, routing     (MOD-dashboard, MOD-admin…)
 deploy      — Docker, CI/CD, runbooks          (MOD-infra…)
 ```
 
-See [INSTANCES.md](INSTANCES.md) for the full guide: naming conventions, scope templates, sizing by codebase size, and anti-patterns.
+See [INSTANCES.md](INSTANCES.md) for the full guide.
 
 ---
 
 ## V-model test coverage
-
-SysEdge enforces the V-model. Each spec artefact has a required test artefact:
 
 | Spec | Test tier | Technology |
 |---|---|---|
@@ -150,18 +169,17 @@ SysEdge enforces the V-model. Each spec artefact has a required test artefact:
 ## Safety model
 
 - `seed` without `--instance` is **blocked** — prevents accidental full overwrites
-- `reset` is a shell script requiring you to type `DELETE ALL SYS NODES` — Claude sessions cannot run it
+- `reset` is a shell script requiring manual confirmation — coding assistant sessions cannot run it
 - Every `seed` auto-backs up before running
 - Sessions only write nodes in their declared instance scope
-- The `amygdala/` directory is an optional PreToolUse hook that enforces these rules in real time — see `amygdala/README.md`
 
 ---
 
 ## Pricing
 
-**Free (this repo):** CLI, skill file, Docker Compose setup, patterns — everything in this README.
+**Free (this repo):** CLI, GEMINI.md, AGENTS.md, Docker Compose setup — everything in this README.
 
-**$149/repository** — [Bootstrap Kit](https://www.org-edge.com/sysedge.html): web visualiser, `/init-sysedge` auto-seed skill, architecture standards catalogue (53 standards), AI test quality audit (`audit-test` — evaluates test files against 7 AS-TEST dimensions), AI requirements adequacy review (`coverage-review --uc/--us` — evaluates UC specs against 7 AS-REQ dimensions), graph analysis, export and analysis commands, session templates, 12 months updates and email support.
+**$149/repository** — [Bootstrap Kit](https://www.org-edge.com/sysedge.html): web visualiser, `/init-sysedge` auto-seed skill, architecture standards catalogue (53 standards), `audit-test` (7 AS-TEST dimensions), `coverage-review --uc/--us` (7 AS-REQ dimensions), graph analysis, export commands, session templates, 12 months updates and email support.
 
 ---
 
