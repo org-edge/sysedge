@@ -131,7 +131,7 @@ Every project needs three permanent roles: `architect` (what to build), `master`
 architect   — US design, ADRs, architecture standards
 master      — US maintenance, E2E tests, shared patterns
 graph       — SysEdge health, backups, seed operations
-content     — Website, README, i18n, help content, skill files (doc staleness tracked)
+content     — Website, README, i18n, help, training content, skill files (doc staleness tracked)
 deploy      — Docker, CI/CD, runbooks, install docs  (doc staleness tracked)
 
 api         — REST handlers, service layer     (MOD-orders, MOD-customers…)
