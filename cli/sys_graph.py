@@ -3251,6 +3251,27 @@ def cmd_worklog(args):
             print(f"  ✓ {r['eid']}  {r['title'][:60]}")
         print()
 
+    # ── Doc artifact staleness — shown for content and deploy instances
+    if instance in ("content", "deploy"):
+        from datetime import datetime, timezone, timedelta
+        _doc_cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        with drv.session() as _ds:
+            _stale_docs = _ds.run("""
+                MATCH (d:SysDocArtifact {instance:$inst})
+                WHERE d.lastReviewedAt IS NULL OR d.lastReviewedAt < $cutoff
+                RETURN d.id AS id, d.path AS path, d.docType AS dtype,
+                       coalesce(d.lastReviewedAt, 'never')[:10] AS reviewed
+                ORDER BY d.docType, d.id
+            """, inst=instance, cutoff=_doc_cutoff).data()
+        if _stale_docs:
+            print(f"\n{'─'*W}")
+            print(f"  DOC ARTIFACTS STALE >30 DAYS ({len(_stale_docs)})")
+            print(f"{'─'*W}")
+            for _d in _stale_docs:
+                print(f"  ⚠  {_d['id']:<28}  [{_d['dtype']}]  last: {_d['reviewed']}")
+                print(f"     {_d['path']}")
+            print(f"  Run: python3 scripts/sys_graph.py mark-doc-reviewed --id DOC-xxx")
+
     # ── Feedback prompt — at end so defects/enhancements are immediately visible
     fb_tag = f"  ({feedback_count} entr{'y' if feedback_count==1 else 'ies'} submitted)" if feedback_count else ""
     print(f"\n{'▶'*2} GRAPH FEEDBACK{fb_tag} — record observations any time this session")
@@ -3875,6 +3896,122 @@ def cmd_quality_review(args):
     print(f"{'═' * W}\n")
     if fail_total:
         sys.exit(1)
+
+
+def cmd_add_doc_artifact(args):
+    """Register a documentation artifact for staleness tracking."""
+    drv = _driver()
+    with drv.session() as s:
+        existing = s.run("MATCH (d:SysDocArtifact {id:$id}) RETURN d.id", id=args.id).single()
+        if existing:
+            print(f"⚠ {args.id} already exists — use mark-doc-reviewed to update", file=sys.stderr)
+            drv.close(); return
+        s.run("""
+            MERGE (d:SysDocArtifact {id:$id})
+            SET d.path=$path, d.instance=$inst, d.docType=$type,
+                d.description=$desc, d.createdAt=$now
+        """, id=args.id, path=args.path, inst=args.instance,
+             type=args.doc_type or "doc", desc=args.description or "", now=_now_iso())
+    drv.close()
+    print(f"✓ {args.id}  [{args.instance}]  {args.path}")
+
+
+def cmd_mark_doc_reviewed(args):
+    """Stamp a doc artifact as reviewed at the current git commit."""
+    import subprocess as _sp
+    commit = args.commit or ""
+    if not commit:
+        try:
+            r = _sp.run(["git", "rev-parse", "--short", "HEAD"],
+                        capture_output=True, text=True, cwd=_root)
+            if r.returncode == 0:
+                commit = r.stdout.strip()
+        except Exception:
+            pass
+    drv = _driver()
+    with drv.session() as s:
+        result = s.run("""
+            MATCH (d:SysDocArtifact {id:$id})
+            SET d.lastReviewedAt=$now, d.lastReviewedAtCommit=$commit,
+                d.reviewer=$reviewer
+            RETURN d.id AS id, d.path AS path
+        """, id=args.id, now=_now_iso(), commit=commit,
+             reviewer=getattr(args, "reviewer", "") or "").single()
+    drv.close()
+    if not result:
+        print(f"⚠ {args.id} not found — run add-doc-artifact first", file=sys.stderr)
+        return
+    print(f"✓ {result['id']}  reviewed at commit {commit or '(unknown)'}  ({result['path']})")
+
+
+def cmd_doc_gaps(args):
+    """Show documentation artifacts not reviewed within --days (default 30).
+
+    Usage:
+      doc-gaps --instance content
+      doc-gaps --instance deploy --days 60
+    """
+    import subprocess as _sp
+    from datetime import datetime, timezone, timedelta
+
+    instance  = getattr(args, "instance", "") or ""
+    days      = getattr(args, "days", 30) or 30
+    cutoff    = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    doc_type  = getattr(args, "type", "") or ""
+
+    # Get current HEAD commit for display
+    head = ""
+    try:
+        r = _sp.run(["git", "rev-parse", "--short", "HEAD"],
+                    capture_output=True, text=True, cwd=_root)
+        if r.returncode == 0:
+            head = r.stdout.strip()
+    except Exception:
+        pass
+
+    drv = _driver()
+    with drv.session() as s:
+        q = """
+            MATCH (d:SysDocArtifact)
+            WHERE ($inst = '' OR d.instance = $inst)
+              AND ($type = '' OR d.docType = $type)
+            RETURN d.id AS id, d.path AS path, d.instance AS inst,
+                   d.docType AS dtype, d.description AS desc,
+                   d.lastReviewedAt AS reviewed, d.lastReviewedAtCommit AS commit
+            ORDER BY d.instance, d.docType, d.id
+        """
+        rows = s.run(q, inst=instance, type=doc_type).data()
+    drv.close()
+
+    stale   = [r for r in rows if not r.get("reviewed") or r["reviewed"] < cutoff]
+    current = [r for r in rows if r.get("reviewed") and r["reviewed"] >= cutoff]
+
+    W = 70
+    print(f"\n{'═'*W}")
+    print(f"  DOC GAPS  {'— ' + instance if instance else '(all instances)'}  "
+          f"(stale > {days}d)  HEAD: {head or 'unknown'}")
+    print(f"{'═'*W}")
+
+    if not stale:
+        print(f"  ✓ All {len(rows)} doc artifacts reviewed within {days} days")
+    else:
+        by_inst: dict = {}
+        for r in stale:
+            by_inst.setdefault(r["inst"] or "?", []).append(r)
+        for inst_name, items in sorted(by_inst.items()):
+            print(f"\n  {inst_name}  ({len(items)} stale)")
+            for r in items:
+                reviewed = (r.get("reviewed") or "never")[:10]
+                commit   = r.get("commit") or "—"
+                print(f"    ⚠  {r['id']:<28}  last: {reviewed}  @ {commit}")
+                print(f"       {r['path']}")
+                if r.get("desc"):
+                    print(f"       {r['desc'][:70]}")
+
+    if current:
+        print(f"\n  ✓ {len(current)} artifact(s) reviewed within {days} days")
+    print(f"\n  Run: python3 scripts/sys_graph.py mark-doc-reviewed --id DOC-xxx")
+    print(f"{'═'*W}\n")
 
 
 def cmd_feedback_submit(args):
@@ -6600,6 +6737,24 @@ def main():
     sp.add_argument("--id",   required=True, help="Comma-separated FB-IDs, e.g. FB-002,FB-004")
     sp.add_argument("--note", default="",    help="Optional note on how it was actioned")
 
+    sp = sub.add_parser("add-doc-artifact", help="Register a documentation artifact for staleness tracking")
+    sp.add_argument("--id",          required=True, help="Artifact ID, e.g. DOC-website-main")
+    sp.add_argument("--path",        required=True, help="File or directory path, e.g. website/sysedge.html")
+    sp.add_argument("--instance",    required=True, help="Owning instance: content or deploy")
+    sp.add_argument("--doc-type",    default="doc",  dest="doc_type",
+                    help="Type: website | readme | skill | runbook | i18n | doc")
+    sp.add_argument("--description", default="")
+
+    sp = sub.add_parser("mark-doc-reviewed", help="Stamp a doc artifact as reviewed at current git commit")
+    sp.add_argument("--id",       required=True, help="Artifact ID, e.g. DOC-website-main")
+    sp.add_argument("--commit",   default="", help="Git commit SHA (auto-detected from HEAD if omitted)")
+    sp.add_argument("--reviewer", default="", help="Who reviewed it (optional)")
+
+    sp = sub.add_parser("doc-gaps", help="Show documentation artifacts not reviewed recently")
+    sp.add_argument("--instance", default="", help="Filter to one instance (content or deploy)")
+    sp.add_argument("--days",     type=int, default=30, help="Flag artifacts not reviewed in N days (default: 30)")
+    sp.add_argument("--type",     default="", help="Filter by docType: website | readme | skill | runbook | i18n")
+
     sp = sub.add_parser("feedback-submit",
                         help="Format feedback as a ready-to-send email for sysedge-feedback@org-edge.com")
     sp.add_argument("--body",     default="", help="Feedback text (creates a new entry)")
@@ -6803,6 +6958,9 @@ def main():
         "feedback":       cmd_feedback,
         "show-feedback":     cmd_show_feedback,
         "ack-feedback":      cmd_ack_feedback,
+        "add-doc-artifact":   cmd_add_doc_artifact,
+        "mark-doc-reviewed":  cmd_mark_doc_reviewed,
+        "doc-gaps":           cmd_doc_gaps,
         "feedback-submit":    cmd_feedback_submit,
         "feedback-summary":  cmd_feedback_summary,
         "add-standard":      cmd_add_standard,

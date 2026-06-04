@@ -131,11 +131,20 @@ Every project needs three permanent roles: `architect` (what to build), `master`
 architect   — US design, ADRs, architecture standards
 master      — US maintenance, E2E tests, shared patterns
 graph       — SysEdge health, backups, seed operations
+content     — Website, README, i18n, help content, skill files (doc staleness tracked)
+deploy      — Docker, CI/CD, runbooks, install docs  (doc staleness tracked)
 
 api         — REST handlers, service layer     (MOD-orders, MOD-customers…)
 auth        — Authentication, permissions      (MOD-auth, MOD-sessions…)
 ui          — Frontend components, routing     (MOD-dashboard, MOD-admin…)
-deploy      — Docker, CI/CD, runbooks          (MOD-infra…)
+```
+
+`content` and `deploy` sessions use `doc-gaps` to find documentation that has drifted from recent code changes:
+
+```bash
+python3 cli/sys_graph.py doc-gaps --instance content   # website, README, skill files
+python3 cli/sys_graph.py doc-gaps --instance deploy    # runbooks, install docs, Docker configs
+python3 cli/sys_graph.py mark-doc-reviewed --id DOC-website-main  # stamp after reviewing
 ```
 
 See [INSTANCES.md](INSTANCES.md) for the full guide.
