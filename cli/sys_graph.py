@@ -191,61 +191,175 @@ def _require_licence(command: str = "") -> None:
         sys.exit(0)
 
 
+# Model aliases → provider-specific model IDs
 _AI_MODELS = {
-    "haiku":  "claude-haiku-4-5-20251001",
-    "sonnet": "claude-sonnet-4-6",
+    "claude": {
+        "haiku":  "claude-haiku-4-5-20251001",
+        "sonnet": "claude-sonnet-4-6",
+    },
+    "gemini": {
+        "haiku":  "gemini-2.5-flash",   # fast/cheap equivalent
+        "sonnet": "gemini-2.5-pro",     # capable equivalent
+    },
+    "qwen": {
+        "haiku":  "qwen-plus",          # fast/cheap equivalent
+        "sonnet": "qwen-max",           # capable equivalent
+    },
 }
 
 
 def _ai_call(prompt: str, model: str = "haiku", max_tokens: int = 2048) -> str:
-    """Send a prompt to Claude and return the text response.
+    """Send a prompt to an available AI provider and return the text response.
 
-    Priority:
-      1. claude CLI  — uses the current Claude Code session tokens (no API key needed)
-      2. anthropic package + ANTHROPIC_API_KEY  — direct API fallback
+    Provider priority (first available wins — all use session tokens where possible):
+      1. claude CLI  — Claude Code session tokens (no API key needed)
+      2. gemini CLI  — Gemini CLI session tokens (free tier: 1,000 req/day)
+      3. qwen CLI    — Qwen Code session tokens (DashScope or local Ollama)
+      4. codex exec  — OpenAI Codex CLI (ChatGPT subscription or OPENAI_API_KEY)
+      5. ANTHROPIC_API_KEY  — direct Anthropic API
+      6. GEMINI_API_KEY     — direct Google Generative AI API
+      7. OPENAI_API_KEY     — direct OpenAI API
+      8. DASHSCOPE_API_KEY  — direct Alibaba DashScope API (Qwen)
 
-    Raises RuntimeError if neither is available.
+    Raises RuntimeError if no provider is available.
     """
     import subprocess as _sp
     import os as _os
 
-    model_id = _AI_MODELS.get(model, _AI_MODELS["haiku"])
+    claude_model  = _AI_MODELS["claude"].get(model,  _AI_MODELS["claude"]["haiku"])
+    gemini_model  = _AI_MODELS["gemini"].get(model,  _AI_MODELS["gemini"]["haiku"])
+    qwen_model    = _AI_MODELS["qwen"].get(model,    _AI_MODELS["qwen"]["haiku"])
 
-    # ── 1. Try claude CLI (Claude Code session tokens) ─────────────────────
+    # ── 1. claude CLI (Claude Code session tokens) ─────────────────────────
     try:
-        result = _sp.run(
-            ["claude", "-p", prompt, "--output-format", "json", "--model", model_id],
-            capture_output=True, text=True, timeout=180,
-            cwd="/tmp",  # avoid loading project CLAUDE.md context
+        r = _sp.run(
+            ["claude", "-p", prompt, "--output-format", "json", "--model", claude_model],
+            capture_output=True, text=True, timeout=180, cwd="/tmp",
         )
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
+        if r.returncode == 0 and r.stdout.strip():
+            data = json.loads(r.stdout)
             text = data.get("result", "")
             if text:
                 return text
     except Exception:
         pass
 
-    # ── 2. Fall back to anthropic package + ANTHROPIC_API_KEY ──────────────
-    api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise RuntimeError(
-            "No AI provider available.\n"
-            "  (a) Run inside a Claude Code session — uses session tokens automatically, or\n"
-            "  (b) Set ANTHROPIC_API_KEY in your .env file"
-        )
+    # ── 2. gemini CLI (Gemini CLI session tokens — free 1,000 req/day) ──────
     try:
-        import anthropic as _anthropic
-        client = _anthropic.Anthropic(api_key=api_key)
-        resp = client.messages.create(
-            model=model_id, max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}]
+        r = _sp.run(
+            ["gemini", "-p", prompt, "--output-format", "json", "--model", gemini_model],
+            capture_output=True, text=True, timeout=180, cwd="/tmp",
         )
-        return resp.content[0].text.strip()
-    except ImportError:
-        raise RuntimeError(
-            "pip install anthropic  (or run inside a Claude Code session)"
+        if r.returncode == 0 and r.stdout.strip():
+            data = json.loads(r.stdout)
+            text = data.get("response", "")  # Gemini uses "response" not "result"
+            if text:
+                return text
+    except Exception:
+        pass
+
+    # ── 3. qwen CLI (Qwen Code — identical interface to Gemini CLI) ──────────
+    try:
+        r = _sp.run(
+            ["qwen", "-p", prompt, "--output-format", "json", "--model", qwen_model],
+            capture_output=True, text=True, timeout=180, cwd="/tmp",
         )
+        if r.returncode == 0 and r.stdout.strip():
+            data = json.loads(r.stdout)
+            text = data.get("response", "")
+            if text:
+                return text
+    except Exception:
+        pass
+
+    # ── 4. codex exec (OpenAI Codex CLI — JSONL stream) ─────────────────────
+    try:
+        r = _sp.run(
+            ["codex", "exec", prompt, "--json"],
+            capture_output=True, text=True, timeout=180, cwd="/tmp",
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            # JSONL stream — find the last agent_message item
+            for line in reversed(r.stdout.strip().splitlines()):
+                try:
+                    ev = json.loads(line)
+                    if (ev.get("type") == "item.completed"
+                            and ev.get("item", {}).get("type") == "agent_message"):
+                        text = ev["item"].get("text", "")
+                        if text:
+                            return text
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # ── 5. ANTHROPIC_API_KEY — direct Anthropic API ──────────────────────────
+    if _os.environ.get("ANTHROPIC_API_KEY", ""):
+        try:
+            import anthropic as _anthropic
+            client = _anthropic.Anthropic(api_key=_os.environ["ANTHROPIC_API_KEY"])
+            resp = client.messages.create(
+                model=claude_model, max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return resp.content[0].text.strip()
+        except Exception:
+            pass
+
+    # ── 6. GEMINI_API_KEY — direct Google Generative AI API ──────────────────
+    if _os.environ.get("GEMINI_API_KEY", ""):
+        try:
+            import google.generativeai as _genai
+            _genai.configure(api_key=_os.environ["GEMINI_API_KEY"])
+            m = _genai.GenerativeModel(gemini_model)
+            resp = m.generate_content(prompt)
+            return resp.text.strip()
+        except Exception:
+            pass
+
+    # ── 7. OPENAI_API_KEY — direct OpenAI API ────────────────────────────────
+    if _os.environ.get("OPENAI_API_KEY", ""):
+        try:
+            import openai as _openai
+            client = _openai.OpenAI(api_key=_os.environ["OPENAI_API_KEY"])
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini" if model == "haiku" else "gpt-4o",
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            pass
+
+    # ── 8. DASHSCOPE_API_KEY — Alibaba Qwen via OpenAI-compatible endpoint ───
+    if _os.environ.get("DASHSCOPE_API_KEY", ""):
+        try:
+            import openai as _openai
+            client = _openai.OpenAI(
+                api_key=_os.environ["DASHSCOPE_API_KEY"],
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            )
+            resp = client.chat.completions.create(
+                model=qwen_model, max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            pass
+
+    raise RuntimeError(
+        "No AI provider available. Options (first found wins):\n"
+        "  Session tokens (no key needed):\n"
+        "    - Run inside Claude Code   (claude CLI)\n"
+        "    - Run inside Gemini CLI    (gemini CLI — free 1,000 req/day)\n"
+        "    - Run inside Qwen Code     (qwen CLI)\n"
+        "    - Run inside OpenAI Codex  (codex CLI)\n"
+        "  API keys (.env file):\n"
+        "    - ANTHROPIC_API_KEY        (Anthropic — pip install anthropic)\n"
+        "    - GEMINI_API_KEY           (Google — pip install google-generativeai)\n"
+        "    - OPENAI_API_KEY           (OpenAI — pip install openai)\n"
+        "    - DASHSCOPE_API_KEY        (Qwen/Alibaba — pip install openai)"
+    )
 
 
 def _alloc_id(session, label: str, prefix: str, pad: int = 0) -> str:
@@ -1430,7 +1544,8 @@ def cmd_record_run(args):
                 id: $runId, packageId: $pkgId,
                 ranAt: $now, passed: $passed, failed: $failed,
                 skipped: $skipped, xfailed: $xfailed,
-                durationS: $dur, status: $status, notes: $notes
+                durationS: $dur, status: $status, notes: $notes,
+                skipReason: $skipReason
             })
             MERGE (pkg)-[:HAS_RUN]->(run)
         """, pkgId=args.package, path=args.package,
@@ -1439,7 +1554,8 @@ def cmd_record_run(args):
              skipped=getattr(args, 'skipped', 0),
              xfailed=getattr(args, 'xfailed', 0),
              dur=args.duration, status=status,
-             notes=getattr(args, 'notes', ''))
+             notes=getattr(args, 'notes', ''),
+             skipReason=getattr(args, 'skip_reason', '') or '')
 
         # Update lastTestedAt on all SysTest nodes via CONTAINS_TEST edges (preferred),
         # falling back to file-path prefix matching for tests registered via seed/link-test.
@@ -3522,7 +3638,9 @@ def cmd_quality_review(args):
                 MATCH (n) WHERE n.id = $id
                 RETURN labels(n) AS lbls, n.wizardBased AS wizardBased,
                        n.title AS title, n.goal AS goal, n.description AS desc,
-                       n.actor AS actor, n.benefit AS benefit
+                       n.actor AS actor, n.benefit AS benefit,
+                       n.preconditions AS preconditions, n.authorizedRoles AS authorizedRoles,
+                       n.failureScenarios AS failureScenarios
             """, id=entity_id).single()
             if not label_row:
                 print(f"ERROR: entity '{entity_id}' not found", file=sys.stderr)
@@ -3532,9 +3650,11 @@ def cmd_quality_review(args):
             entity_text   = " ".join(filter(None, [
                 label_row.get("title"), label_row.get("goal"),
                 label_row.get("actor"), label_row.get("benefit"),
-                label_row.get("desc"),
+                label_row.get("preconditions"), label_row.get("authorizedRoles"),
+                label_row.get("failureScenarios"), label_row.get("desc"),
             ]))
-            targets = [(entity_id, entity_labels, wizard_based, entity_text)]
+            entity_fields = {k: label_row.get(k) or "" for k in ("actor","goal","benefit","title")}
+            targets = [(entity_id, entity_labels, wizard_based, entity_text, entity_fields)]
         else:
             target_types = [type_filter] if type_filter else ["SysUseCase", "SysFeature", "SysUserStory"]
             targets = []
@@ -3546,7 +3666,7 @@ def cmd_quality_review(args):
                     """, inst=instance).data()
                     for r in rows:
                         txt = " ".join(filter(None, [r.get("t"), r.get("d")]))
-                        targets.append((r["id"], [t], r.get("wb") or False, txt))
+                        targets.append((r["id"], [t], r.get("wb") or False, txt, {}))
                 elif t == "SysFeature":
                     rows = s.run("""
                         MATCH (m:SysModule {instance:$inst})-[:PROVIDES]->(n:SysFeature)
@@ -3562,7 +3682,9 @@ def cmd_quality_review(args):
                     """, inst=instance).data()
                     for r in rows:
                         txt = " ".join(filter(None, [r.get("t"), r.get("g"), r.get("a"), r.get("b")]))
-                        targets.append((r["id"], [t], False, txt))
+                        fields = {"actor": r.get("a") or "", "goal": r.get("g") or "",
+                                  "benefit": r.get("b") or "", "title": r.get("t") or ""}
+                        targets.append((r["id"], [t], False, txt, fields))
 
         if not targets:
             print(f"No entities found for {'instance ' + instance if instance else entity_id}")
@@ -3579,16 +3701,22 @@ def cmd_quality_review(args):
             "feature_without_test":    ("MATCH (n:SysFeature {id:$id}) WHERE NOT (:SysTest)-[:VERIFIES]->(n) RETURN count(n) AS n", "No VERIFIES→Feature test"),
         }
 
-        def _text_check(check_key: str, text: str, eid: str) -> tuple[bool, str]:
+        def _text_check(check_key: str, text: str, eid: str,
+                        efields: dict | None = None) -> tuple[bool, str]:
             """Returns (passes, detail) for text-based QUS automated checks."""
             import re as _re
             tl = (text or "").lower()
+            fields = efields or {}
             if check_key == "story_wellformed":
-                ok = ("as a" in tl or "as an" in tl) and ("i want" in tl or "i need" in tl or "i can" in tl)
-                return ok, "" if ok else "Missing 'As a [role], I want [means]' structure"
+                # Accept prose 'As a/I want' OR structured actor+goal fields (ENH-919)
+                prose_ok = ("as a" in tl or "as an" in tl) and ("i want" in tl or "i need" in tl or "i can" in tl)
+                structured_ok = bool(fields.get("actor")) and bool(fields.get("goal"))
+                ok = prose_ok or structured_ok
+                return ok, "" if ok else "Missing 'As a [role], I want [means]' structure OR actor+goal fields"
             if check_key == "story_atomic":
-                # Flag if goal contains splitting conjunctions between verb phrases
-                goal_part = tl.split("so that")[0] if "so that" in tl else tl
+                # Prefer goal field alone (ENH-919); fall back to full text
+                goal_text = (fields.get("goal") or tl).lower()
+                goal_part = goal_text.split("so that")[0] if "so that" in goal_text else goal_text
                 ok = not _re.search(r'\band\b.{5,}\band\b', goal_part)
                 return ok, "" if ok else "Goal may combine multiple objectives (conjunction detected)"
             if check_key == "story_minimal":
@@ -3621,7 +3749,7 @@ def cmd_quality_review(args):
         fail_total = suggest_total = pass_total = manual_total = review_total = 0
         all_entity_fails = []
 
-        for eid, elabels, ewizard, etext in targets:
+        for eid, elabels, ewizard, etext, efields in targets:
             applicable = [
                 std for std in all_stds
                 if any(lbl in (std["types"] or []) for lbl in elabels)
@@ -3653,7 +3781,7 @@ def cmd_quality_review(args):
                         n = s.run(q, id=eid).single()["n"]
                         passes = (n == 0)
                     elif check and check.startswith("story_"):
-                        passes, gap = _text_check(check, etext, eid)
+                        passes, gap = _text_check(check, etext, eid, efields)
                     elif check == "coverage_ratio":
                         # TRC-006: system-level ratio check, skip per-entity
                         continue
@@ -3693,11 +3821,22 @@ def cmd_quality_review(args):
                 for std in deferred_ai:
                     sid   = std["id"]
                     tbadge = f"[{(std.get('tier') or 'def')[:3]}]"
+                    # Build structured entity block with labelled fields (ENH-922)
+                    entity_block_parts = [f"ID: {eid}"]
+                    for lbl, key in [("Title", "title"), ("Actor", "actor"), ("Goal", "goal"),
+                                     ("Benefit", "benefit"), ("Preconditions", "preconditions"),
+                                     ("Authorized roles", "authorizedRoles"),
+                                     ("Failure scenarios", "failureScenarios"),
+                                     ("Description", "desc")]:
+                        val = label_row.get(key) if label_row else efields.get(key.lower(), "")
+                        if val:
+                            entity_block_parts.append(f"{lbl}: {str(val)[:300]}")
+                    entity_block = "\n".join(entity_block_parts) or etext[:800]
                     prompt = (
                         f"You are evaluating an entity against a quality standard.\n\n"
-                        f"## Entity: {eid}\n{etext[:800]}\n\n"
+                        f"## Entity\n{entity_block}\n\n"
                         f"## Standard: {std['title']}\n{std.get('desc','')}\n\n"
-                        f"Evaluate the entity text against this standard. "
+                        f"Evaluate the entity against this standard. "
                         f"Return exactly one line: SCORE: GOOD|WEAK|POOR — one sentence reasoning."
                     )
                     try:
@@ -5275,9 +5414,54 @@ def cmd_audit_test(args):
     )
     context_block = "\n".join(context_lines)
 
-    # Truncate very large test files to fit context (keep first 6000 chars + note)
-    if len(test_content) > 6000:
-        test_excerpt = test_content[:6000] + f"\n\n... [truncated — {len(test_content)} chars total]"
+    # ENH-918: for large files, build a structured AST summary instead of raw truncation.
+    # Raw truncation only shows imports/fixtures and misses test method bodies, causing
+    # false FAILs on AS-TEST-UC-001/003/007. The summary covers ALL classes and methods.
+    TRUNCATE_THRESHOLD = 8000
+    if len(test_content) > TRUNCATE_THRESHOLD and p.suffix == ".py":
+        try:
+            tree = ast.parse(test_content)
+            lines = []
+            lines.append(f"# Structured summary of {p.name} ({len(test_content):,} chars, {test_content.count(chr(10))} lines)")
+            lines.append("# Full class/method inventory — all test methods listed\n")
+            # Module-level docstring
+            if (ast.get_docstring(tree)):
+                lines.append(f'"""Module: {ast.get_docstring(tree)[:200]}"""\n')
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                    cls_doc = ast.get_docstring(node) or ""
+                    lines.append(f"\nclass {node.name}:")
+                    if cls_doc:
+                        lines.append(f'    """{cls_doc[:150]}"""')
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test_"):
+                            fn_doc = ast.get_docstring(item) or ""
+                            decorators = [ast.unparse(d) for d in item.decorator_list] if item.decorator_list else []
+                            for dec in decorators:
+                                lines.append(f"    @{dec}")
+                            lines.append(f"    def {item.name}(self, ...):  # line {item.lineno}")
+                            if fn_doc:
+                                lines.append(f'        """{fn_doc[:200]}"""')
+                            # Include first few non-docstring lines of the method body
+                            body_lines = []
+                            for stmt in item.body:
+                                if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+                                    continue  # skip docstring
+                                try:
+                                    body_lines.append(f"        {ast.unparse(stmt)[:120]}")
+                                except Exception:
+                                    pass
+                                if len(body_lines) >= 6:
+                                    body_lines.append("        ...")
+                                    break
+                            lines.extend(body_lines)
+            test_excerpt = "\n".join(lines)
+            test_excerpt += f"\n\n# END SUMMARY — full source is {len(test_content):,} chars"
+        except Exception:
+            test_excerpt = test_content[:TRUNCATE_THRESHOLD] + f"\n\n... [truncated at {TRUNCATE_THRESHOLD} chars of {len(test_content):,}]"
+    elif len(test_content) > TRUNCATE_THRESHOLD:
+        # Non-Python files: still truncate but at a higher limit
+        test_excerpt = test_content[:TRUNCATE_THRESHOLD] + f"\n\n... [truncated — {len(test_content):,} chars total]"
     else:
         test_excerpt = test_content
 
@@ -6384,7 +6568,9 @@ def main():
     sp.add_argument("--skipped",  type=int, default=0)
     sp.add_argument("--xfailed",  type=int, default=0, help="Expected failures (xfail)")
     sp.add_argument("--duration", type=float, default=0.0, help="Total run duration in seconds")
-    sp.add_argument("--notes",    default="", help="Optional run notes")
+    sp.add_argument("--notes",       default="", help="Optional run notes")
+    sp.add_argument("--skip-reason", default="", dest="skip_reason",
+                    help="Why tests were skipped: missing-fixture | code-bug | ai-dependent | env-config | other")
 
     sp = sub.add_parser("test-status", help="Show last-run timestamps and stale tests")
     sp.add_argument("--days",     type=int, default=7,  help="Flag tests not run in this many days (default 7)")
